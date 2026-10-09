@@ -1,0 +1,26 @@
+[package]
+name = "macroquad-sion-test"
+version = "0.1.0"
+edition = "2024"
+description = "Macroquad RPG title-menu engine demo with fully synthesized libSiON-rs audio"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "macroquad_sion_test"
+path = "src/lib.rs"
+
+[[bin]]
+name = "title_menu"
+path = "src/bin/title_menu.rs"
+
+[dependencies]
+macroquad = { version = "0.4.16", default-features = false }
+libsion = { package = "libSiON-rs", path = "../libSiON-rs", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal = "0.18.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

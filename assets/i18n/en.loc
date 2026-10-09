@@ -1,0 +1,35 @@
+# Moonlight Chronicle - UI strings, English (default locale).
+# Format: key = value. '#' starts a comment; values are raw text after '='.
+
+game.title = MOONLIGHT CHRONICLE
+
+menu.start = Start
+menu.load = Load Game
+menu.options = Options
+menu.exit = Exit
+
+title.hint = ↑↓ Select   Enter / Z Decide   Esc Exit
+footer.engine = libSiON-rs {0} - one streaming driver: looping title theme + live SFX
+
+dialogue.hint = Enter / Z Advance    Esc Back
+speaker.aria = Aria
+line.prologue.1 = The tower bells stopped ringing at dusk...
+line.prologue.2 = Will you walk with me to the old gate?
+
+load.title = Load Game
+load.subtitle = Save Data
+load.slot = Save Slot {0}
+load.stats = LV --   Play 0:00
+load.empty = No data
+load.plate = Select a slot to load the adventure.
+load.none = -- Empty save slot: nothing to load --
+load.hint = ↑↓ Slots   Enter Load   Esc Back
+
+options.title = Options
+options.music = Music Volume
+options.sfx = Sound FX Volume
+options.language = Language
+options.note = SFX bank: SiMML one-shots from assets/sfx/*.mml · music & SFX levels independent.
+options.hint = ← → Adjust    Up/Down Rows    Esc Back
+
+exit.farewell = Farewell...

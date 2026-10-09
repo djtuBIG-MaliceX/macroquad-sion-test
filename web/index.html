@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>macroquad-sion-test — Title Menu</title>
+<style>
+  html,body{margin:0;padding:0;background:#07080f;height:100%;overflow:hidden}
+  #glcanvas{display:block;width:100vw;height:100vh;outline:none}
+  #boot{position:fixed;left:50%;top:46%;transform:translate(-50%,-50%);
+        color:#cfd4dd;font:16px/1.5 monospace;text-align:center;user-select:none}
+  #boot small{display:block;color:#8a8f9c;margin-top:4px}
+</style>
+</head>
+<body tabindex="-1">
+<canvas id="glcanvas" tabindex="0"></canvas>
+<div id="boot">loading wasm…<small id="bootmsg"></small></div>
+
+<!-- miniquad/macroquad JS bundle (gl.js from the matching miniquad crate):
+     canvas + WebGL host functions, event plumbing, asset XHR FS. It also
+     defines the `env` imports (incl. now()) that libSiON-rs uses for its
+     wasm seed/tick clocks. -->
+<script src="js/mq_js_bundle.js"></script>
+
+<!-- No wasi/emscripten shims anymore: the binary is built for
+     wasm32-unknown-unknown and its only imports are the `env` functions gl.js
+     ships, so nothing has to be patched onto WebAssembly.instantiate. -->
+
+<script id="sion-audio">
+"use strict";
+// ---------------------------------------------------------------------------
+// libSiON-rs realtime audio: script-processor pumping interleaved f32 stereo
+// straight from the wasm staging block (sion_wasm_pump -> ptr into memory).
+// ---------------------------------------------------------------------------
+
+const SION_BLOCK_FRAMES = 2048;   // must match audio::BLOCK_FRAMES
+const SION_RATE = 44100;          // must match audio::SAMPLE_RATE
+
+let sionAudioStarted = false;
+const scratch = new Float32Array(SION_BLOCK_FRAMES * 2);
+
+function sionStartAudio() {
+  if (sionAudioStarted) return; sionAudioStarted = true;
+
+  const AC = window.AudioContext || window.webkitAudioContext;
+  // pinned rate so the driver never needs resampling glue
+  const ctx = new AC({ sampleRate: SION_RATE });
+
+  // unlock from user gesture (autoplay policy); miniquad registers a similar
+  // one-shot in its audio plugin - ours targets the main-thread pump
+  window.addEventListener("pointerdown", () => ctx.resume());
+  window.addEventListener("keydown", () => ctx.resume());
+
+  const node = ctx.createScriptProcessor(SION_BLOCK_FRAMES, 1, 2);
+  node.onaudioprocess = (e) => {
+    const outL = e.outputBuffer.getChannelData(0);
+    const outR = e.outputBuffer.getChannelData(1);
+
+    if (!window.wasm_exports || typeof wasm_exports.sion_wasm_pump !== "function") {
+      outL.fill(0); outR.fill(0); return;
+    }
+
+    const ptr = wasm_exports.sion_wasm_pump(SION_BLOCK_FRAMES);
+    if (!ptr) { outL.fill(0); outR.fill(0); return; }
+
+    // re-view the heap each call: ALLOW_MEMORY_GROWTH reallocates the buffer
+    const src = new Float32Array(wasm_memory.buffer, ptr, SION_BLOCK_FRAMES * 2);
+    for (let i = 0; i < SION_BLOCK_FRAMES; i++) {
+      outL[i] = src[i * 2];
+      outR[i] = src[i * 2 + 1];
+    }
+  };
+
+  node.connect(ctx.destination);
+}
+window.addEventListener("pointerdown", sionStartAudio);
+window.addEventListener("keydown", sionStartAudio);
+window.addEventListener("load", () => { try { sionStartAudio(); } catch (e) { console.warn("audio init deferred:", e); } });
+
+// hide the boot overlay once wasm exports exist (frame loop is running)
+const bootPoll = setInterval(() => {
+  if (window.wasm_exports && wasm_exports.frame) {
+    document.getElementById("boot").style.display = "none";
+    clearInterval(bootPoll);
+  }
+}, 250);
+</script>
+
+<script>load("title_menu.wasm");</script>
+<script>document.getElementById("glcanvas").focus();</script>
+</body>
+</html>

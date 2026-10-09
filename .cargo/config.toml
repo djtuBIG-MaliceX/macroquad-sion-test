@@ -1,0 +1,5 @@
+# Browser builds use wasm32-unknown-unknown (the only target macroquad/miniquad
+# actually supports): linking goes through the built-in rust-lld and needs no
+# external toolchain, so nothing is pinned here anymore. The old
+# wasm32-unknown-emscripten linker config produced a binary that miniquad's
+# gl.js runtime cannot host (wasi/emscripten imports, no memory-growth glue).

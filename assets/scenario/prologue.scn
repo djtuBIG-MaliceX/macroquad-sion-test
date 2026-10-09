@@ -1,0 +1,13 @@
+# Prologue — demo scenario script.
+# The seed of the scenario scripting engine: `[page]` blocks hold only
+# structure (who speaks, which line). The text itself is an l10n key that
+# resolves through the active locale (assets/i18n/*.loc), so switching
+# language re-voices every scripted line without touching this file.
+
+[page]
+speaker = speaker.aria
+text = line.prologue.1
+
+[page]
+speaker = speaker.aria
+text = line.prologue.2

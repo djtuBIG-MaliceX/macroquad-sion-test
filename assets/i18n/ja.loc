@@ -1,0 +1,35 @@
+# 月華奇譚 - UI文字列、日本語。
+# 形式：キー = 値。'#' はコメント；'=' の後はそのままのテキスト。
+
+game.title = 月華奇譚
+
+menu.start = スタート
+menu.load = ロード
+menu.options = 設定
+menu.exit = お別れ
+
+title.hint = ↑↓ 選択   Enter / Z 決定   Esc 戻る
+footer.engine = libSiON-rs {0} —— 単一のストリーミング駆動：タイトル曲ループ + ライブSE
+
+dialogue.hint = Enter / Z 進む    Esc 戻る
+speaker.aria = アリア
+line.prologue.1 = 塔の鐘が止まったのは、夕暮れ……
+line.prologue.2 = 古い正門まで、付いてきてくれる？
+
+load.title = ロード
+load.subtitle = セーブデータ
+load.slot = セーブスロット {0}
+load.stats = Lv --   プレイ 0:00
+load.empty = データなし
+load.plate = 冒険をロードするスロットを選んでください。
+load.none = —— 空のスロット：読み込めるデータはありません ——
+load.hint = ↑↓ スロット   Enter 読込   Esc 戻る
+
+options.title = 設定
+options.music = 音楽音量
+options.sfx = 効果音音量
+options.language = 言語
+options.note = SEバンク：assets/sfx/*.mml の SiMML ワンショット · 音楽と効果音の音量は独立。
+options.hint = ← → 調整    ↑↓ 行の移動    Esc 戻る
+
+exit.farewell = さようなら……
