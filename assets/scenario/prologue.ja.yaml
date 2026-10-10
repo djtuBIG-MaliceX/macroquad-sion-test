@@ -1,0 +1,28 @@
+# Prologue (Japanese) — locale-suffixed scenario picked up when the active
+# language is Japanese; every other locale falls back to prologue.yaml.
+# Same l10n dialogue keys (the .loc table supplies the translated lines),
+# but this variant stages them with its own pacing and extra effects, so a
+# locale can re-choreograph the scene, not just re-voice it.
+
+commands:
+  - image: { file: scene, appear: fade, seconds: 0.8 }
+
+  - music: assets/audio/options_theme.mml
+    # (same song; any registered SiMML/.ogg/.wav path works here)
+
+  - dialog:
+      speaker: speaker.aria
+      text: line.prologue.1
+
+  - wait: 0.5
+  - shake: { strength: 6, seconds: 0.8 }
+  - sfx: assets/sfx/confirm.mml
+
+  - dialog:
+      speaker: speaker.aria
+      text: line.prologue.2
+
+  - animate: { target: scene, to: [560, 180], seconds: 1.6 }
+  - wait: 2.0
+
+  - next

@@ -15,6 +15,11 @@ use macroquad::prelude::*;
 pub const WINDOW_WIDTH: u32 = 1280;
 pub const WINDOW_HEIGHT: u32 = 720;
 
+/// Default (English) title-theme registration key and asset location.
+pub const TITLE_THEME_PATH: &str = "assets/audio/title_theme.mml";
+/// Options-screen theme; keys double as registration paths in the engine.
+pub const OPTIONS_THEME_PATH: &str = "assets/audio/options_theme.mml";
+
 /// Passed to `#[macroquad::main(...)]` in downstream binaries.
 pub fn window_conf() -> Conf {
     Conf {
@@ -64,7 +69,57 @@ pub async fn title_mml() -> Result<String, String> {
             .map_err(|e| format!("cannot read MML '{}' ({e})", path.display()));
     }
 
-    load_asset_text("assets/audio/title_theme.mml").await
+    load_asset_text(TITLE_THEME_PATH).await
+}
+
+/// Load one audio asset and classify it by flavour: SiMML text for MML-ish
+/// extensions, raw container bytes (decoded later by the `samples` bus via
+/// macroquad — wav/ogg/mp3…) for everything else.
+pub async fn load_audio_asset(path: &str) -> Result<crate::audio::AudioAsset, String> {
+    if crate::audio::samples::is_sample_path(path) {
+        Ok(crate::audio::AudioAsset::Bytes(load_asset_bytes(path).await?))
+    } else {
+        Ok(crate::audio::AudioAsset::Mml(load_asset_text(path).await?))
+    }
+}
+
+/// Locale-aware scenario resolution by filename suffix: try
+/// `assets/scenario/<base>.<locale>.yaml` first, then the default
+/// (English) `assets/scenario/<base>.yaml`. Returns the parsed script and
+/// which file produced it (empty when only the embedded fallback ran).
+pub async fn load_scenario(
+    base: &str,
+    locale: crate::l10n::Locale,
+) -> Result<(crate::scenario::Scenario, String), String> {
+    let stem = locale.stem();
+    let localized = format!("assets/scenario/{base}.{stem}.yaml");
+    let mut tried = Vec::new();
+
+    for path in [localized.as_str(), &format!("assets/scenario/{base}.yaml")] {
+        match load_asset_text(path).await {
+            Ok(text) => return Ok((crate::scenario::Scenario::parse(&text), path.to_string())),
+            Err(e) => tried.push(format!("{path} ({e})")),
+        }
+    }
+    Err(format!("no scenario asset for '{base}': {}", tried.join(", ")))
+}
+
+/// Fetch + decode every referenced PNG once at startup into a path-keyed
+/// bank (scenario `image:` commands then draw without async). Native path
+/// resolution follows macroquad's cwd convention; `$SION_TEST_ASSETS` does
+/// not apply to textures. Failures are skipped with a warning — the stage
+/// simply never shows that layer.
+pub async fn load_image_assets(paths: &[String]) -> std::collections::HashMap<String, Texture2D> {
+    let mut bank = std::collections::HashMap::new();
+    for path in paths {
+        match macroquad::texture::load_texture(path).await {
+            Ok(tex) => {
+                bank.insert(path.clone(), tex);
+            }
+            Err(e) => eprintln!("image asset '{path}' unavailable: {e}"),
+        }
+    }
+    bank
 }
 
 /// Load every registered SFX one-shot from `assets/sfx/<stem>.mml`.

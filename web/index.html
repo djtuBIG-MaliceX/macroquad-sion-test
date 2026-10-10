@@ -21,9 +21,145 @@
      wasm seed/tick clocks. -->
 <script src="js/mq_js_bundle.js"></script>
 
-<!-- No wasi/emscripten shims anymore: the binary is built for
-     wasm32-unknown-unknown and its only imports are the `env` functions gl.js
-     ships, so nothing has to be patched onto WebAssembly.instantiate. -->
+<!-- The binary's `env` imports are gl.js functions plus the ten `audio_*`
+     host calls quad-snd (macroquad's "audio" feature) declares for wasm.
+     gl.js 0.4.x does NOT ship them — stubbing instead of linking would make
+     sound loading poll forever. The plugin below is the supported extension
+     point (miniquad_add_plugin), filling env before the module instantiates. -->
+
+<script id="macroquad-audio-plugin">
+"use strict";
+// ---------------------------------------------------------------------------
+// WebAudio backend for quad-snd's wasm imports: decodes wav/ogg/mp3 (whatever
+// the browser can) with decodeAudioData, plays through BufferSource chains.
+// Gain model mirrors quad-snd: per-Sound multiplier x per-playback volume, so
+// Rust's set_sound_volume sweeps every live instance of an asset at once.
+// ---------------------------------------------------------------------------
+(() => {
+  const sources = new Map();    // id -> { buffer, failed, baseVol, playbacks:Set, pending:[] }
+  const playbacks = new Map();  // id -> { srcId, node, vol }
+  let audioCtx = null, outBus = null;
+  let srcSeq = 1, pbSeq = 1;
+
+  function ensure() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC({ latencyHint: "interactive" });
+      outBus = audioCtx.createGain();
+      outBus.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  }
+
+  function stopPlayback(pbId) {
+    const pb = playbacks.get(pbId);
+    if (!pb) return;
+    try { pb.src && pb.src.stop(); } catch (e) { /* already ended */ }
+    try { pb.node && pb.node.disconnect(); } catch (e) {}
+    playbacks.delete(pbId);
+    const src = sources.get(pb.srcId);
+    if (src) src.playbacks.delete(pbId);
+  }
+
+  function begin(entry, pbId) {
+    const pb = playbacks.get(pbId);
+    if (!pb || !entry.buffer) return;         // failed decode stays silent
+    const node = audioCtx.createGain();
+    node.gain.value = pb.vol * entry.baseVol;
+    node.connect(outBus);
+    const src = audioCtx.createBufferSource();
+    src.buffer = entry.buffer;
+    src.loop = pb.loop;
+    src.connect(node);
+    src.onended = (ev) => { if (ev.target === src && playbacks.has(pbId)) stopPlayback(pbId); };
+    src.start();
+    pb.src = src;
+  }
+
+  const host = {
+    audio_init() { ensure(); },
+
+    audio_add_buffer(ptr, len) {
+      ensure();
+      const id = srcSeq++;
+      // copy out immediately: the heap reallocates when it grows
+      const bytes = new Uint8Array(wasm_memory.buffer, ptr >>> 0, len >>> 0).slice();
+      const entry = { buffer: null, failed: false, baseVol: 1, playbacks: new Set() };
+      sources.set(id, entry);
+      audioCtx.decodeAudioData(bytes.buffer).then(
+        (buf) => { entry.buffer = buf; },
+        (e) => {
+          // report "loaded" so macroquad's loader loop terminates; play is a no-op
+          entry.failed = true;
+          console.warn("audio decode failed:", e);
+        }
+      );
+      return id;
+    },
+
+    audio_source_is_loaded(id) {
+      const s = sources.get(id);
+      return !!s && (s.buffer !== null || s.failed);
+    },
+
+    audio_play_buffer(id, volume, repeat) {
+      ensure();
+      const pbId = pbSeq++;
+      const entry = sources.get(id);
+      if (!entry) return pbId;             // deleted already: silent id
+      const pb = { srcId: id, node: null, src: null, vol: volume, loop: !!repeat };
+      playbacks.set(pbId, pb);
+      entry.playbacks.add(pbId);
+      if (entry.buffer !== null || entry.failed) begin(entry, pbId);
+      else setTimeout(() => {              // poll decode (no callback hook)
+        if (playbacks.has(pbId)) begin(entry, pbId);
+      }, 10);
+      return pbId;
+    },
+
+    audio_source_set_volume(id, volume) {
+      const s = sources.get(id);
+      if (!s) return;
+      s.baseVol = volume;
+      for (const pbId of s.playbacks) {
+        const pb = playbacks.get(pbId);
+        if (pb && pb.node) pb.node.gain.value = pb.vol * volume;
+      }
+    },
+
+    audio_source_stop(id) {
+      const s = sources.get(id);
+      if (!s) return;
+      for (const pbId of [...s.playbacks]) stopPlayback(pbId);
+    },
+
+    audio_source_delete(id) {
+      host.audio_source_stop(id);
+      sources.delete(id);
+    },
+
+    audio_playback_stop(pbId) { stopPlayback(pbId); },
+
+    audio_playback_set_volume(pbId, volume) {
+      const pb = playbacks.get(pbId);
+      if (!pb) return;
+      pb.vol = volume;
+      const s = sources.get(pb.srcId);
+      if (pb.node && s) pb.node.gain.value = volume * s.baseVol;
+    },
+  };
+
+  // unlock the shared audio context on first gesture (autoplay policy)
+  window.addEventListener("pointerdown", () => { if (audioCtx) audioCtx.resume(); });
+  window.addEventListener("keydown", () => { if (audioCtx) audioCtx.resume(); });
+
+  miniquad_add_plugin({
+    name: "macroquad_audio",   // matches macroquad_audio_crate_version() == 1
+    version: 1,
+    register_plugin(imports) { Object.assign(imports.env, host); },
+  });
+})();
+</script>
 
 <script id="sion-audio">
 "use strict";

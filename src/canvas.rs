@@ -15,6 +15,16 @@ thread_local! {
     /// (offset_x, offset_y, scale) of the composited rect for input mapping.
     static RECT: Cell<(f32, f32, f32)> = const { Cell::new((0.0, 0.0, 1.0)) };
     static IN_UI_PASS: Cell<bool> = const { Cell::new(false) };
+    /// Current screen-shake displacement applied at composite time only;
+    /// the letterbox stays black, so a shaken frame just rims with black.
+    static SHAKE: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Displace the composited virtual canvas by a screen-shake offset (virtual
+/// pixels). Runners set it every frame; `(0, 0)` restores a still image.
+/// Input mapping deliberately ignores the shake.
+pub fn set_shake(offset: Vec2) {
+    SHAKE.set((offset.x, offset.y));
 }
 
 /// True while drawing inside the RT UI pass (`begin_frame`..`end_frame`).
@@ -89,12 +99,16 @@ pub fn end_frame() {
 
         RECT.set((x, y, scale));
 
+        // Screen shake displaces only the composite; `RECT` (input mapping)
+        // stays at the resting position, and exposed bars are just black.
+        let (shk_x, shk_y) = SHAKE.get();
+
         // GL framebuffer textures sample V-flipped relative to CPU-uploaded
         // textures (font atlas included); the composite corrects it once.
         draw_texture_ex(
             &target.texture,
-            x,
-            y,
+            x + shk_x,
+            y + shk_y,
             WHITE,
             DrawTextureParams { dest_size: Some(Vec2::new(w, h)), flip_y: true, ..Default::default() },
         );

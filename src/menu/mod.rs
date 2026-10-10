@@ -1,19 +1,25 @@
-//! The full screen stack of the demo: Title menu, a dialogue-scene stub
-//! (procedural scene image + typewriter box from the scenario script), an
+//! The full screen stack of the demo: Title menu, a scripted scene runner
+//! (YAML scenario commands staging images, dialogue, shake and audio), an
 //! RPG-Maker-style save browser, the Options page (volumes + language) and
 //! a fade-out Exit. Every interactive action routes into `crate::audio`,
 //! which triggers precompiled SiON-rs material on the live music driver.
 //!
 //! All visible copy is asset-driven: UI strings from `assets/i18n/*.loc`
-//! and scripted dialogue from `assets/scenario/*.scn` (l10n key refs), so
-//! the Language option re-voices every screen at once. English is default.
+//! and scripted dialogue (l10n key refs) from locale-resolved
+//! `assets/scenario/*.yaml`, so the Language option re-voices every screen
+//! and swaps to `<base>.<locale>.yaml` staging at once. English is default.
+//! Music is per-screen: the title theme on menu/scene/save screens, the
+//! options theme on Options — every screen switch restarts music from zero.
+
+use std::collections::HashMap;
 
 use macroquad::prelude::*;
 
 use crate::audio::{self, SfxId};
 use crate::canvas;
+use crate::config;
 use crate::l10n::Loc;
-use crate::scenario::Scenario;
+use crate::scenario::{self, Appear, ImageSpec, Scenario};
 use crate::ui::theme;
 use crate::ui::widgets::{FontSet, Menu, MenuEntry, Slider};
 
@@ -25,15 +31,70 @@ pub enum Outcome {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Title,
-    Dialogue,
+    Scene,
     LoadGame,
     Options,
     Exit,
 }
 
-struct DialogueState {
-    page: usize,
+/// A staged picture layer on the scene canvas (`image:` / `animate:`).
+struct StageImage {
+    /// Animate target handle: explicit `name`, else the file stem.
+    name: String,
+    /// Engine placeholder portrait when `None` (`file: scene`).
+    tex: Option<Texture2D>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Appear fade: alpha ramps `fade_t / fade_dur` (0 dur = instant).
+    fade_t: f32,
+    fade_dur: f32,
+    anim: Option<Slide>,
+}
+
+/// In-flight slide of a stage image (eased with smoothstep).
+struct Slide {
+    fx: f32,
+    fy: f32,
+    tx: f32,
+    ty: f32,
+    dur: f32,
+    t: f32,
+}
+
+/// Decaying camera shake (virtual pixels over `dur` seconds).
+struct ShakeState {
+    amp: f32,
+    t: f32,
+    dur: f32,
+}
+
+/// Interpreter state for the YAML command program.
+struct SceneState {
+    /// Index of the next command to run.
+    idx: usize,
+    /// Countdown paused mid-program after a `wait:` command.
+    wait_left: f32,
+    /// Paused at a `dialog:` command awaiting the player's keypress.
+    at_dialogue: bool,
+    /// (speaker key, text key) of the visible line, if any.
+    page: Option<(String, String)>,
     chars_shown: f32,
+    stage: Vec<StageImage>,
+}
+
+impl SceneState {
+    fn new() -> SceneState {
+        SceneState {
+            idx: 0,
+            wait_left: 0.0,
+            at_dialogue: false,
+            page: None,
+            chars_shown: 0.0,
+            stage: Vec::new(),
+        }
+    }
 }
 
 struct LoadState {
@@ -71,18 +132,31 @@ pub struct App {
 
     portrait: RenderTarget,
 
+    /// Base name (without locale suffix/extension) of the running script.
+    scenario_base: String,
     script: Scenario,
-    dialogue: DialogueState,
+    /// PNG bank preloaded at startup (path → texture).
+    images: HashMap<String, Texture2D>,
+    scene: SceneState,
+    /// Set when Options swaps locale; the host binary re-fetches the
+    /// `<base>.<locale>` script and answers via `set_scenario`.
+    scenario_request: Option<String>,
     load_state: LoadState,
     options: OptionsState,
 
+    shake: Option<ShakeState>,
     sfx_gain: f32,
     exit_t: f32,
     transition: Option<Transition>,
 }
 
 impl App {
-    pub fn new(fonts: FontSet, loc: Loc, script: Scenario) -> App {
+    pub fn new(
+        fonts: FontSet,
+        loc: Loc,
+        script: Scenario,
+        images: HashMap<String, Texture2D>,
+    ) -> App {
         let portrait = gen_portrait_texture();
 
         let app = App {
@@ -96,22 +170,46 @@ impl App {
                 MenuEntry { key: "menu.exit" },
             ]),
             portrait,
+            scenario_base: "prologue".to_string(),
             script,
-            dialogue: DialogueState { page: 0, chars_shown: 0.0 },
+            images,
+            scene: SceneState::new(),
+            scenario_request: None,
             load_state: LoadState { selected: 0, tried_empty: false },
             options: OptionsState {
                 row: 0,
                 music: Slider::new("options.music", 0.85),
                 sfx: Slider::new("options.sfx", 0.75),
             },
+            shake: None,
             sfx_gain: 0.75,
             exit_t: 0.0,
             transition: None,
         };
 
         let music_v = app.options.music.value;
-        audio::with(move |e| e.set_music_volume(music_v));
+        audio::set_music_level(music_v);
         app
+    }
+
+    /// Hand a freshly fetched scenario script to the runner (locale swap or
+    /// hot-reload); the program restarts from its first command.
+    pub fn set_scenario(&mut self, base: &str, script: Scenario) {
+        self.scenario_base = base.to_string();
+        self.script = script;
+        self.scene = SceneState::new();
+    }
+
+    /// Take the pending "reload the scenario for the new locale" request.
+    pub fn take_scenario_request(&mut self) -> Option<String> {
+        self.scenario_request.take()
+    }
+
+    /// Merge additional preloaded textures into the image bank.
+    pub fn add_images(&mut self, more: HashMap<String, Texture2D>) {
+        for (path, tex) in more {
+            self.images.insert(path, tex);
+        }
     }
 
     /// Begin a short fade-to-black into `target`; input is swallowed until
@@ -123,21 +221,178 @@ impl App {
         }
     }
 
-    /// Swap to `target` at the black midpoint and seed its fresh state there,
-    /// so no screen pops in half-initialized.
+    /// Swap to `target` at the black midpoint: seed its fresh state there
+    /// (so no screen pops in half-initialized) and restart that screen's
+    /// music track from the top — going between screens always re-starts.
     fn commit(&mut self, target: Mode) {
         match target {
-            Mode::Dialogue => self.dialogue = DialogueState { page: 0, chars_shown: 0.0 },
+            Mode::Scene => self.scene = SceneState::new(),
             Mode::LoadGame => self.load_state = LoadState { selected: 0, tried_empty: false },
             Mode::Options => self.options.row = 0,
             _ => {}
         }
+        self.shake = None;
+        canvas::set_shake(Vec2::ZERO);
+
+        let track = match target {
+            Mode::Options => config::OPTIONS_THEME_PATH,
+            _ => config::TITLE_THEME_PATH,
+        };
+        audio::play_track(track);
+
         self.mode = target;
     }
 
     fn play_sfx(&mut self, id: SfxId) {
         let gain = self.sfx_gain;
         audio::with(move |e| e.play_sfx(id, gain));
+    }
+
+    // ------------------------------------------------------------ scene runner
+
+    /// Execute scenario commands until one pauses the program (dialogue,
+    /// wait) or it ends (`next` / end of list → back to the title menu).
+    fn run_script(&mut self) {
+        loop {
+            if self.scene.idx >= self.script.commands.len() {
+                self.end_scene();
+                return;
+            }
+            let cmd = self.script.commands[self.scene.idx].clone();
+            self.scene.idx += 1; // consumed the moment it starts
+
+            match cmd {
+                scenario::Command::Dialog { speaker, text } => {
+                    self.scene.page = Some((speaker, text));
+                    self.scene.chars_shown = 0.0;
+                    self.scene.at_dialogue = true;
+                    return;
+                }
+                scenario::Command::Music(track) => {
+                    audio::play_track(track.path());
+                }
+                scenario::Command::Sfx(sfx) => {
+                    let (path, gain) = (sfx.path().to_string(), self.sfx_gain);
+                    audio::sfx_file(&path, gain);
+                }
+                scenario::Command::Image(spec) => self.stage_image(&spec),
+                scenario::Command::Animate(anim) => {
+                    let target = anim.target.as_deref();
+                    let idx = match target {
+                        Some(name) => self.scene.stage.iter().rposition(|i| i.name == name),
+                        None => Some(self.scene.stage.len().saturating_sub(1)),
+                    };
+                    match idx {
+                        Some(i) => {
+                            let img = &mut self.scene.stage[i];
+                            img.anim = Some(Slide {
+                                fx: img.x,
+                                fy: img.y,
+                                tx: anim.to.0,
+                                ty: anim.to.1,
+                                dur: anim.seconds.max(0.05),
+                                t: 0.0,
+                            });
+                        }
+                        None => eprintln!("animate target '{}' not staged - skipped", target.unwrap_or("(last)")),
+                    }
+                }
+                scenario::Command::Shake(sh) => {
+                    self.shake = Some(ShakeState { amp: sh.strength, t: 0.0, dur: sh.seconds.max(0.05) });
+                }
+                scenario::Command::Wait(secs) => {
+                    self.scene.wait_left = secs.max(0.0);
+                    return;
+                }
+                scenario::Command::Next => {
+                    self.end_scene();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Advance fades and slides by `dt` (called every Scene frame).
+    fn tick_stage(&mut self, dt: f32) {
+        for img in &mut self.scene.stage {
+            if img.fade_t < img.fade_dur {
+                img.fade_t = (img.fade_t + dt).min(img.fade_dur);
+            }
+            if let Some(an) = img.anim.as_mut() {
+                an.t += dt;
+                let p = (an.t / an.dur).clamp(0.0, 1.0);
+                let e = p * p * (3.0 - 2.0 * p); // smoothstep
+                img.x = an.fx + (an.tx - an.fx) * e;
+                img.y = an.fy + (an.ty - an.fy) * e;
+                if p >= 1.0 {
+                    img.anim = None;
+                }
+            }
+        }
+        if let Some(sh) = &mut self.shake {
+            sh.t += dt;
+        }
+    }
+
+    /// Stage one `image:` layer: resolve texture, compute its placement box,
+    /// push it on top of the stack.
+    fn stage_image(&mut self, spec: &ImageSpec) {
+        let (file, name, appear, secs, boxxy) = match spec {
+            ImageSpec::Path(p) => (p.clone(), None, Appear::default(), 0.5f32, None),
+            ImageSpec::Detailed { file, name, appear, seconds, x, y, w, h } => (
+                file.clone(),
+                name.clone(),
+                *appear,
+                *seconds,
+                match (x, y, w, h) {
+                    (&Some(x), &Some(y), &Some(w), &Some(h)) => Some((x, y, w, h)),
+                    _ => None,
+                },
+            ),
+        };
+
+        let is_scene = scenario::is_scene(&file);
+        let (tex, tex_w, tex_h) = if is_scene {
+            (None, self.portrait.texture.width(), self.portrait.texture.height())
+        } else {
+            match self.images.get(&file).cloned() {
+                Some(t) => {
+                    let (tw, th) = (t.width(), t.height());
+                    (Some(t), tw, th)
+                }
+                None => {
+                    eprintln!("stage image '{file}' missing - layer skipped");
+                    return;
+                }
+            }
+        };
+
+        // Default placement: backdrop-height, centered horizontally.
+        let (x, y, w, h) = boxxy.unwrap_or_else(|| {
+            let h = canvas::vh() * 0.72;
+            let w = if tex_w > 0.0 { h * (tex_w / tex_h) } else { canvas::vw() * 0.75 };
+            ((canvas::vw() - w) * 0.5, (canvas::vh() - h) * 0.42, w, h)
+        });
+
+        let name = name.unwrap_or_else(|| file_stem(&file));
+        let fade_dur = if appear == Appear::Instant { 0.0 } else { secs.max(0.01) };
+        self.scene.stage.push(StageImage {
+            name,
+            tex,
+            x,
+            y,
+            w,
+            h,
+            fade_t: if appear == Appear::Instant { 1.0 } else { 0.0 },
+            fade_dur,
+            anim: None,
+        });
+    }
+
+    /// `next` (or command-list exhaustion): close the scene gracefully.
+    fn end_scene(&mut self) {
+        self.play_sfx(SfxId::Back);
+        self.switch_to(Mode::Title);
     }
 
     /// Language row value label; always in the target language's own script.
@@ -177,7 +432,7 @@ impl App {
                     match self.title_menu.selected() {
                         0 => {
                             self.play_sfx(SfxId::Confirm);
-                            self.switch_to(Mode::Dialogue);
+                            self.switch_to(Mode::Scene);
                         }
                         1 => {
                             self.play_sfx(SfxId::Confirm);
@@ -190,10 +445,7 @@ impl App {
                         _ => {
                             // Exit: fade audio once, visuals follow via exit_t.
                             self.play_sfx(SfxId::Exit);
-                            audio::with(|e| {
-                                e.stop_music_looping();
-                                e.fade_out_master(1.2);
-                            });
+                            audio::fade_all_out(1.2);
                             self.exit_t = 0.0;
                             self.mode = Mode::Exit;
                         }
@@ -202,34 +454,40 @@ impl App {
 
                 if pressed(KeyCode::Escape) || pressed(KeyCode::X) {
                     self.play_sfx(SfxId::Exit);
-                    audio::with(|e| {
-                        e.stop_music_looping();
-                        e.fade_out_master(1.2);
-                    });
+                    audio::fade_all_out(1.2);
                     self.exit_t = 0.0;
                     self.mode = Mode::Exit;
                 }
             }
 
-            Mode::Dialogue => {
-                self.dialogue.chars_shown += dt * 34.0;
+            Mode::Scene => {
+                self.tick_stage(dt);
 
-                if pressed(KeyCode::Enter) || pressed(KeyCode::Space) || pressed(KeyCode::Z) {
-                    let page = &self.script.pages[self.dialogue.page];
-                    let total = self.loc.t(&page.text_key).chars().count();
-                    if (self.dialogue.chars_shown as usize) < total {
-                        self.dialogue.chars_shown = total as f32; // reveal all
-                    } else if self.dialogue.page + 1 < self.script.pages.len() {
-                        self.play_sfx(SfxId::Move);
-                        self.dialogue.page += 1;
-                        self.dialogue.chars_shown = 0.0;
-                    } else {
+                if self.scene.wait_left > 0.0 {
+                    // mid-program delay: swallow nothing, just pace commands
+                    self.scene.wait_left = (self.scene.wait_left - dt).max(0.0);
+                } else if self.scene.at_dialogue {
+                    self.scene.chars_shown += dt * 34.0;
+
+                    if pressed(KeyCode::Enter) || pressed(KeyCode::Space) || pressed(KeyCode::Z) {
+                        let total = self
+                            .scene
+                            .page
+                            .as_ref()
+                            .map(|(_, k)| self.loc.t(k).chars().count())
+                            .unwrap_or(0);
+                        if (self.scene.chars_shown as usize) < total {
+                            self.scene.chars_shown = total as f32; // reveal all
+                        } else {
+                            self.scene.at_dialogue = false;
+                            self.run_script(); // continue the program at once
+                        }
+                    } else if pressed(KeyCode::Escape) || pressed(KeyCode::X) {
                         self.play_sfx(SfxId::Back);
                         self.switch_to(Mode::Title);
                     }
-                } else if pressed(KeyCode::Escape) || pressed(KeyCode::X) {
-                    self.play_sfx(SfxId::Back);
-                    self.switch_to(Mode::Title);
+                } else {
+                    self.run_script();
                 }
             }
 
@@ -276,7 +534,7 @@ impl App {
                         0 => {
                             if self.options.music.adjust(dir) {
                                 let v = self.options.music.value;
-                                audio::with(move |e| e.set_music_volume(v));
+                                audio::set_music_level(v);
                             }
                         }
                         1 => {
@@ -288,10 +546,13 @@ impl App {
                             audio::with(move |e| e.slider_blip(v, v.max(0.15)));
                         }
                         _ => {
-                            // Language row: live-switch every string in place.
+                            // Language row: live-switch every string in place,
+                            // and ask the host to swap in the locale's own
+                            // scenario staging file (`<base>.<locale>.yaml`).
                             let next = self.loc.active().shifted(dir);
                             self.loc.set_active(next);
                             self.play_sfx(SfxId::Move);
+                            self.scenario_request = Some(self.scenario_base.clone());
                         }
                     }
                 }
@@ -316,12 +577,12 @@ impl App {
 
     // ------------------------------------------------------------------- draw
 
-    pub fn draw(&self) {
+    pub fn draw(&mut self) {
         theme::draw_gradient_background();
 
         match self.mode {
             Mode::Title => self.draw_title(),
-            Mode::Dialogue => self.draw_dialogue(),
+            Mode::Scene => self.draw_scene(),
             Mode::LoadGame => self.draw_loadgame(),
             Mode::Options => self.draw_options(),
             Mode::Exit => {}
@@ -331,6 +592,21 @@ impl App {
             Mode::Title | Mode::LoadGame => self.draw_footer(),
             _ => {}
         }
+
+        // Screen shake: sine wobble with linear decay, x stronger than y.
+        // Cleared (never left over) whenever no shake is active.
+        let expired = self.shake.as_ref().is_some_and(|sh| sh.t >= sh.dur);
+        if expired {
+            self.shake = None;
+        }
+        let off = match &self.shake {
+            Some(sh) => {
+                let decay = 1.0 - (sh.t / sh.dur).clamp(0.0, 1.0);
+                Vec2::new(sh.amp * decay * (sh.t * 38.0).sin(), sh.amp * decay * 0.55 * (sh.t * 29.0 + 1.7).sin())
+            }
+            None => Vec2::ZERO,
+        };
+        canvas::set_shake(off);
 
         if let Some(tr) = &self.transition {
             // triangle wave through full black at the midpoint, smoothstepped
@@ -374,21 +650,35 @@ impl App {
         );
     }
 
-    fn draw_dialogue(&self) {
-        // full-bleed sample scene standing in for the real background art
-        let sh = canvas::vh();
-        let sw = canvas::vw();
-        draw_texture_ex(
-            &self.portrait.texture,
-            0.0,
-            -24.0,
-            WHITE,
-            DrawTextureParams { dest_size: Some(Vec2::new(sh * 0.75, sh + 48.0)), flip_y: true, ..Default::default() },
-        );
-        // darken sides so the panel reads over the scene
+    fn draw_scene(&self) {
+        let (sw, sh) = (canvas::vw(), canvas::vh());
+
+        // Staged image layers bottom-up; RT/loaded textures are V-flipped.
+        for img in &self.scene.stage {
+            let tex = match &img.tex {
+                Some(t) => t,
+                None => &self.portrait.texture,
+            };
+            let a = if img.fade_dur <= 0.0 {
+                1.0
+            } else {
+                (img.fade_t / img.fade_dur).clamp(0.0, 1.0)
+            };
+            draw_texture_ex(
+                tex,
+                img.x,
+                img.y,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(Vec2::new(img.w, img.h)), flip_y: true, ..Default::default() },
+            );
+        }
+
+        // darken sides so the panel reads over any staged art
         let fade = sh * 0.18;
         draw_rectangle(0.0, 0.0, fade, sh, Color::new(0.02, 0.02, 0.05, 0.4));
         draw_rectangle(sw - fade, 0.0, fade, sh, Color::new(0.02, 0.02, 0.05, 0.4));
+
+        let Some((speaker_key, text_key)) = self.scene.page.clone() else { return };
 
         let bw = sw * 0.76;
         let bh = 192.0;
@@ -396,9 +686,8 @@ impl App {
         let by = sh - bh - 34.0;
         theme::draw_panel(bx, by, bw, bh);
 
-        let page = &self.script.pages[self.dialogue.page];
-        let speaker = self.loc.t(&page.speaker_key);
-        let line = self.loc.t(&page.text_key);
+        let speaker = self.loc.t(&speaker_key);
+        let line = self.loc.t(&text_key);
 
         self.fonts.text(&speaker, bx + 30.0, by - 16.0, 32.0, theme::CURSOR);
         draw_rectangle(
@@ -411,10 +700,10 @@ impl App {
 
         // typewriter over the localized text (switch languages freely)
         let total = line.chars().count();
-        let shown: String = line.chars().take((self.dialogue.chars_shown as usize).min(total)).collect();
+        let shown: String = line.chars().take((self.scene.chars_shown as usize).min(total)).collect();
         self.fonts.text(&shown, bx + 34.0, by + 78.0, 30.0, theme::INK);
 
-        if (self.dialogue.chars_shown as usize) >= total && (get_time() * 3.0).sin() > 0.0 {
+        if (self.scene.chars_shown as usize) >= total && (get_time() * 3.0).sin() > 0.0 {
             let sx = bx + bw - 46.0;
             draw_triangle(
                 Vec2::new(sx, by + bh - 48.0),
@@ -624,6 +913,16 @@ fn gen_portrait_texture() -> RenderTarget {
             draw_line(bx + 10.0, by, bx, by + 7.0, 2.5, Color::new(0.1, 0.1, 0.15, 1.0));
         }
     })
+}
+
+/// Layer name for a staged file: last path component minus extension.
+fn file_stem(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn mix(a: Color, b: Color, t: f32) -> Color {

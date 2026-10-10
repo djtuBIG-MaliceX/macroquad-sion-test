@@ -2,8 +2,9 @@
 #   usage: pwsh -File web\build-wasm.ps1 [-NoBuild]
 #
 # macroquad's web backend only works on wasm32-unknown-unknown: the binary is
-# a plain module whose `env` imports are satisfied entirely by miniquad's
-# gl.js. No emsdk involvement, and the JS MUST come from the same miniquad
+# a plain module whose `env` imports are satisfied by miniquad's gl.js plus
+# the macroquad_audio plugin embedded in web/index.html (audio_* WebAudio host
+# calls; gl.js itself ships none). The JS MUST come from the same miniquad
 # version as Cargo.lock pins (older bundles lack e.g. renderbuffer imports).
 param([switch]$NoBuild)
 
@@ -44,11 +45,16 @@ New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot 'assets/scenario') 
 Copy-Item (Join-Path $release 'title_menu.wasm') (Join-Path $PSScriptRoot 'title_menu.wasm') -Force
 Copy-Item $gljs (Join-Path $PSScriptRoot 'js/mq_js_bundle.js') -Force
 Copy-Item (Join-Path $root 'assets/fonts/NotoSansJP-VF.ttf') (Join-Path $PSScriptRoot 'assets/fonts/') -Force
-Copy-Item (Join-Path $root 'assets/audio/title_theme.mml')  (Join-Path $PSScriptRoot 'assets/audio/') -Force
-Copy-Item (Join-Path $root 'assets/sfx/*.mml')              (Join-Path $PSScriptRoot 'assets/sfx/')   -Force
+Copy-Item (Join-Path $root 'assets/audio/*')                  (Join-Path $PSScriptRoot 'assets/audio/') -Force
+Copy-Item (Join-Path $root 'assets/sfx/*')                  (Join-Path $PSScriptRoot 'assets/sfx/')   -Force
 Copy-Item (Join-Path $root 'assets/i18n/*.loc')             (Join-Path $PSScriptRoot 'assets/i18n/')  -Force
-Copy-Item (Join-Path $root 'assets/scenario/*.scn')         (Join-Path $PSScriptRoot 'assets/scenario/') -Force
+Copy-Item (Join-Path $root 'assets/scenario/*.yaml')        (Join-Path $PSScriptRoot 'assets/scenario/') -Force
+if (Test-Path (Join-Path $root 'assets/images')) {
+    New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot 'assets/images') | Out-Null
+    Copy-Item (Join-Path $root 'assets/images/*')             (Join-Path $PSScriptRoot 'assets/images/') -Force
+}
 
 Write-Host ''
 Write-Host "web/ staged (gl.js from miniquad $mqVer). Serve with:  python -m http.server 8000 -d web"
+Write-Host 'scenario YAML, all MML (title+options themes) and images/ are staged too.'
 Write-Host 'then open  http://localhost:8000/  and click once to unlock audio.'

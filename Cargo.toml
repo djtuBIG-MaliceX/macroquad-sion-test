@@ -14,8 +14,9 @@ name = "title_menu"
 path = "src/bin/title_menu.rs"
 
 [dependencies]
-macroquad = { version = "0.4.16", default-features = false }
+macroquad = { version = "0.4.16", default-features = false, features = ["audio"] }
 libsion = { package = "libSiON-rs", path = "../libSiON-rs", default-features = false }
+yaml-rust2 = "0.13.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.18.2"
@@ -24,3 +25,8 @@ cpal = "0.18.2"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# See vendor/quad-alsa-sys-stub/Cargo.toml: sidesteps the universal-resolver
+# links=alsa collision between cpal (SiON sink) and macroquad audio.
+[patch.crates-io]
+quad-alsa-sys = { path = "vendor/quad-alsa-sys-stub" }

@@ -24,7 +24,9 @@ fn music_gain_is_independent_and_never_compounds() {
         .collect();
     assert_eq!(sfx.len(), SfxId::ALL.len());
 
-    let mut engine = AudioEngine::new(Some(mml), &sfx);
+    let mut engine = AudioEngine::new(&sfx);
+    // Registration keys are asset paths; start_music plays the first one.
+    engine.add_song(macroquad_sion_test::config::TITLE_THEME_PATH, mml);
     engine.set_music_volume(1.0);
     engine.start_music();
 
@@ -88,7 +90,8 @@ fn sfx_assets_are_the_single_source_of_truth() {
     // An engine with no SFX sources still boots (the demo simply loses that
     // effect rather than crashing) — assets are optional, not duplicated.
     let mml = read("assets/audio/title_theme.mml");
-    let mut engine = AudioEngine::new(Some(mml), &[]);
+    let mut engine = AudioEngine::new(&[]);
+    engine.add_song(macroquad_sion_test::config::TITLE_THEME_PATH, mml);
     engine.start_music();
     engine.pump_for_test(2);
     assert!(engine.is_streaming());

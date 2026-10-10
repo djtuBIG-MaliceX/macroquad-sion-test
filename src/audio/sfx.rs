@@ -45,7 +45,7 @@ impl SfxId {
 
     /// Upper bound on the one-shot phrase (16th-beats) handed to
     /// `sequence_on`; assets may be shorter but not effectively longer.
-    fn max_length(self) -> f64 {
+    pub(crate) fn max_length(self) -> f64 {
         match self {
             SfxId::Move => 2.0,
             SfxId::Confirm | SfxId::Back => 24.0,
@@ -81,6 +81,13 @@ impl SfxBank {
     /// before `sion::finalize()`).
     pub fn clear_compiled(&mut self) {
         self.entries.clear();
+    }
+
+    /// Map an asset path back to its bank id, so scenario `sfx:` commands
+    /// that point at a bank asset reuse the precompiled entry instead of
+    /// demanding a duplicate registration.
+    pub fn id_for_path(&self, path: &str) -> Option<SfxId> {
+        self.entries.iter().find(|(id, _, _)| id.asset_path() == path).map(|(id, _, _)| *id)
     }
 
     pub fn play(

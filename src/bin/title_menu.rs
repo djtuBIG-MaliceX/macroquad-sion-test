@@ -5,7 +5,7 @@
 
 use macroquad::prelude::*;
 
-use macroquad_sion_test::audio::{self, AudioEngine};
+use macroquad_sion_test::audio::{self, samples, AudioAsset, AudioEngine, SfxId};
 use macroquad_sion_test::canvas;
 use macroquad_sion_test::config::{self, window_conf};
 use macroquad_sion_test::l10n::{Loc, Locale};
@@ -20,7 +20,7 @@ const KEEP_AUDIO_FRAMES: usize = 4096;
 async fn main() {
     // A missing title-theme asset means silence: no built-in tune is ever
     // played in its place.
-    let mml = match config::title_mml().await {
+    let title_mml = match config::title_mml().await {
         Ok(text) => Some(text),
         Err(e) => {
             eprintln!("title theme unavailable: {e} - music disabled");
@@ -45,22 +45,67 @@ async fn main() {
         }
     }
 
-    let script = match config::load_asset_text("assets/scenario/prologue.scn").await {
-        Ok(text) => Scenario::parse(&text),
+    // Scenario program, locale-resolved (`<base>.<locale>.yaml` first:
+    // Japanese staging when selected, this English default otherwise). Its
+    // referenced audio/images must ALL be preloaded now: SiMML compilation
+    // stops the live stream, so registration happens before any playback.
+    let base = "prologue";
+    let (script, scn_path) = match config::load_scenario(base, loc.active()).await {
+        Ok(pair) => pair,
         Err(e) => {
-            eprintln!("scenario asset unavailable: {e} - using embedded prologue");
-            Scenario::prologue()
+            eprintln!("scenario assets unavailable: {e} - using embedded prologue");
+            (Scenario::prologue(), String::new())
         }
     };
+    if !scn_path.is_empty() {
+        eprintln!("scenario script: {scn_path}");
+    }
 
     // SFX bank is asset-driven: load every assets/sfx/<stem>.mml before the
-    // engine compiles them (compile stops any live stream, so this precedes
-    // start_music). Missing files are skipped with a warning by the loader.
+    // engine compiles them. Missing files are skipped with a warning by the
+    // loader.
     let sfx_sources = config::sfx_sources().await;
+
+    // Screen-music paths: options theme plus anything extra the script's
+    // `music:` commands reference (deduplicated).
+    let refs = script.asset_refs();
+    let mut music_paths: Vec<String> = vec![config::OPTIONS_THEME_PATH.to_string()];
+    for p in refs.music {
+        if !music_paths.iter().any(|m| m == &p) {
+            music_paths.push(p);
+        }
+    }
 
     // mut only needed natively for cpal stream wiring (web pumps via JS)
     #[allow(unused_mut)]
-    let mut engine = AudioEngine::new(mml, &sfx_sources);
+    let mut engine = AudioEngine::new(&sfx_sources);
+
+    if let Some(mml) = title_mml {
+        engine.add_song(config::TITLE_THEME_PATH, mml);
+    }
+    for path in &music_paths {
+        match config::load_audio_asset(path).await {
+            Ok(AudioAsset::Mml(mml)) => engine.add_song(path, mml),
+            // sampled files (wav/ogg/mp3…) decode via macroquad's `samples` bus
+            Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
+            Err(e) => eprintln!("music asset '{path}' unavailable: {e}"),
+        }
+    }
+
+    // Scenario `sfx:` assets that aren't already bank effects (bank ids
+    // keep their own precompiled entries and route by path at play time).
+    for (path, beats) in refs.effects {
+        if SfxId::ALL.iter().any(|(id, _)| id.asset_path() == path) {
+            continue;
+        }
+        match config::load_audio_asset(&path).await {
+            Ok(AudioAsset::Mml(mml)) => engine.add_effect_mml(&path, mml, beats),
+            Ok(AudioAsset::Bytes(bytes)) => samples::register(&path, &bytes).await,
+            Err(e) => eprintln!("sfx asset '{path}' unavailable: {e}"),
+        }
+    }
+
+    let images = config::load_image_assets(&refs.images).await;
 
     #[cfg(not(target_arch = "wasm32"))]
     let _stream = match engine.start_native_output() {
@@ -74,7 +119,7 @@ async fn main() {
     audio::install(engine);
     audio::with(|e| e.start_music());
 
-    let mut app = App::new(fonts, loc, script);
+    let mut app = App::new(fonts, loc, script, images);
 
     let autoexit: Option<f64> = std::env::var("SION_TEST_AUTOEXIT_SECS")
         .ok()
@@ -91,9 +136,63 @@ async fn main() {
         let dt = get_frame_time();
         let now_s = get_time() - started;
 
+        // Locale swap in Options => fetch the `<base>.<locale>` scenario and
+        // anything new it references. Compiling fresh MML momentarily stops
+        // the stream; the loop pump resyncs whichever song owns `current`,
+        // so music simply starts again over the new staging.
+        if let Some(base) = app.take_scenario_request() {
+            let locale = app.loc.active();
+            let (script, path) = match config::load_scenario(&base, locale).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("scenario reload '{base}' failed: {e} - embedded fallback");
+                    let embedded = match locale {
+                        Locale::Japanese => Scenario::prologue_ja(),
+                        Locale::English => Scenario::prologue(),
+                    };
+                    (embedded, String::new())
+                }
+            };
+            if !path.is_empty() {
+                eprintln!("scenario script: {path}");
+            }
+
+            let refs = script.asset_refs();
+            for path in &refs.music {
+                // sample assets live in the macroquad bank; MML songs on the driver
+                let known = if samples::is_sample_path(path) {
+                    samples::has(path)
+                } else {
+                    audio::with(|e| e.has_track(path)).unwrap_or(false)
+                };
+                if known {
+                    continue;
+                }
+                match config::load_audio_asset(path).await {
+                    Ok(AudioAsset::Mml(mml)) => drop(audio::with(|e| e.add_song(path, mml))),
+                    Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
+                    Err(e) => eprintln!("music asset '{path}' unavailable: {e}"),
+                }
+            }
+            for (path, beats) in &refs.effects {
+                if SfxId::ALL.iter().any(|(id, _)| id.asset_path() == *path) {
+                    continue; // bank effect already registered
+                }
+                match config::load_audio_asset(path).await {
+                    Ok(AudioAsset::Mml(mml)) => drop(audio::with(|e| e.add_effect_mml(path, mml, *beats))),
+                    Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
+                    Err(e) => eprintln!("sfx asset '{path}' unavailable: {e}"),
+                }
+            }
+            app.add_images(config::load_image_assets(&refs.images).await);
+            app.set_scenario(&base, script);
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         audio::with(|e| e.tick_native(KEEP_AUDIO_FRAMES));
+
+        // macroquad sample-bus housekeeping (exit-fade ramp; no-op at rest)
+        audio::tick(dt);
 
         if let Some(ms) = auto_sfx_ms {
             let t = (now_s * 1000.0) as u64;
@@ -157,9 +256,10 @@ async fn main() {
         next_frame().await;
     }
 
-    // graceful teardown: let queued samples drain, stop the callback and
-    // only then release the global SiON statics.
-    audio::with(|e| e.stop_music_looping());
+    // graceful teardown: sweep both buses (driver + macroquad samples), let
+    // queued samples drain, stop the callback and only then release the
+    // global SiON statics.
+    audio::fade_all_out(0.4);
 
     #[cfg(not(target_arch = "wasm32"))]
     {

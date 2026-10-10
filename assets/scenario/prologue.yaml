@@ -1,0 +1,45 @@
+# Prologue — demo scenario for the YAML scripting engine.
+#
+# The active locale picks `prologue.<locale>.yaml` when present (e.g.
+# `prologue.ja.yaml`) and falls back to this default (English) file.
+# Dialogue `speaker`/`text` stay l10n keys resolved through
+# assets/i18n/*.loc, so the language option still re-voices every line.
+#
+# Commands run top to bottom:
+#   dialog: {speaker, text}        stage a line; waits for Enter/Z to advance
+#   music:  <path|{file}>          switch song (SiMML / .ogg / .wav;
+#                                  .mp3 decodes in browsers only), plays from top
+#   sfx:    <path|{file, beats}>   one-shot effect (same formats)
+#   image:  <path|{file, name, appear, seconds, x, y, w, h}>
+#                                  `scene` = generated placeholder backdrop;
+#                                  appear: fade (default) | instant
+#   animate: {target, to: [x,y], seconds}   slide an image (default: last)
+#   shake:  <seconds|{strength, seconds}>   camera shake in virtual pixels
+#   wait:   <seconds>              silent delay
+#   next                           end the scenario (back to the title menu)
+
+commands:
+  - image: { file: scene, appear: instant }
+
+  - music: assets/audio/options_theme.mml
+
+  - sfx: assets/sfx/confirm.mml
+
+  # sampled SFX bus (macroquad): .ogg/.wav native+web, .mp3 browser-only
+  - sfx: assets/sfx/voice_cue.ogg
+
+  - dialog:
+      speaker: speaker.aria
+      text: line.prologue.1
+
+  - wait: 0.35
+  - shake: { strength: 9, seconds: 0.5 }
+
+  - dialog:
+      speaker: speaker.aria
+      text: line.prologue.2
+
+  - animate: { target: scene, to: [640, 150], seconds: 1.2 }
+  - wait: 1.4
+
+  - next

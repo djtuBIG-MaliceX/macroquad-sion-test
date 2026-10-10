@@ -1,0 +1,17 @@
+# Stub replacing crates-io `quad-alsa-sys` via [patch.crates-io].
+#
+# This project's real targets are Windows and wasm32. Cargo's resolver,
+# however, builds a universal dependency graph: cpal's Linux `alsa-sys`
+# and quad-snd/macroquad-audio's Linux `quad-alsa-sys` both declare
+# `links = "alsa"`, and cargo refuses to lock two links=alsa crates even
+# though both edges are cfg(linux)-gated and never built here (rust-lang#4242).
+# The stub carries no `links` key, so the lock succeeds and Linux output
+# (unused in this demo) is intentionally unavailable.
+[package]
+name = "quad-alsa-sys"
+version = "0.3.2"
+edition = "2021"
+description = "link-conflict stub: no ALSA bindings (Windows/wasm-only project)"
+
+[lib]
+path = "src/lib.rs"
