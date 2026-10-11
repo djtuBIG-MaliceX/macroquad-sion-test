@@ -86,6 +86,8 @@ async fn main() {
     for path in &music_paths {
         match config::load_audio_asset(path).await {
             Ok(AudioAsset::Mml(mml)) => engine.add_song(path, mml),
+            // MIDI files parse into reserved-track songs (no stream stop)
+            Ok(AudioAsset::Midi(bytes)) => engine.add_midi_song(path, &bytes),
             // sampled files (wav/ogg/mp3…) decode via macroquad's `samples` bus
             Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
             Err(e) => eprintln!("music asset '{path}' unavailable: {e}"),
@@ -100,6 +102,7 @@ async fn main() {
         }
         match config::load_audio_asset(&path).await {
             Ok(AudioAsset::Mml(mml)) => engine.add_effect_mml(&path, mml, beats),
+            Ok(AudioAsset::Midi(bytes)) => engine.add_midi_song(&path, &bytes),
             Ok(AudioAsset::Bytes(bytes)) => samples::register(&path, &bytes).await,
             Err(e) => eprintln!("sfx asset '{path}' unavailable: {e}"),
         }
@@ -170,6 +173,9 @@ async fn main() {
                 }
                 match config::load_audio_asset(path).await {
                     Ok(AudioAsset::Mml(mml)) => drop(audio::with(|e| e.add_song(path, mml))),
+                    Ok(AudioAsset::Midi(bytes)) => {
+                        let _ = audio::with(|e| e.add_midi_song(path, &bytes));
+                    }
                     Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
                     Err(e) => eprintln!("music asset '{path}' unavailable: {e}"),
                 }
@@ -180,6 +186,9 @@ async fn main() {
                 }
                 match config::load_audio_asset(path).await {
                     Ok(AudioAsset::Mml(mml)) => drop(audio::with(|e| e.add_effect_mml(path, mml, *beats))),
+                    Ok(AudioAsset::Midi(bytes)) => {
+                        let _ = audio::with(|e| e.add_midi_song(path, &bytes));
+                    }
                     Ok(AudioAsset::Bytes(bytes)) => samples::register(path, &bytes).await,
                     Err(e) => eprintln!("sfx asset '{path}' unavailable: {e}"),
                 }

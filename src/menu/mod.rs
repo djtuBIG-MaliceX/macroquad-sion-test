@@ -5,11 +5,13 @@
 //! which triggers precompiled SiON-rs material on the live music driver.
 //!
 //! All visible copy is asset-driven: UI strings from `assets/i18n/*.loc`
-//! and scripted dialogue (l10n key refs) from locale-resolved
-//! `assets/scenario/*.yaml`, so the Language option re-voices every screen
+//! and scripted dialogue as literal text inside locale-resolved
+//! `assets/scenario/*.yaml` (each locale's script carries its own
+//! translated lines), so the Language option re-voices every screen
 //! and swaps to `<base>.<locale>.yaml` staging at once. English is default.
-//! Music is per-screen: the title theme on menu/scene/save screens, the
-//! options theme on Options — every screen switch restarts music from zero.
+//! Music is per-screen (title theme on menu/scene/save, options theme on
+//! Options), but replaying the track that is already sounding never
+//! restarts it — only an actual track change does (see `crate::audio`).
 
 use std::collections::HashMap;
 
@@ -78,7 +80,7 @@ struct SceneState {
     wait_left: f32,
     /// Paused at a `dialog:` command awaiting the player's keypress.
     at_dialogue: bool,
-    /// (speaker key, text key) of the visible line, if any.
+    /// (speaker, text) literal copy of the visible line, if any.
     page: Option<(String, String)>,
     chars_shown: f32,
     stage: Vec<StageImage>,
@@ -474,7 +476,7 @@ impl App {
                             .scene
                             .page
                             .as_ref()
-                            .map(|(_, k)| self.loc.t(k).chars().count())
+                            .map(|(_, text)| text.chars().count())
                             .unwrap_or(0);
                         if (self.scene.chars_shown as usize) < total {
                             self.scene.chars_shown = total as f32; // reveal all
@@ -678,16 +680,13 @@ impl App {
         draw_rectangle(0.0, 0.0, fade, sh, Color::new(0.02, 0.02, 0.05, 0.4));
         draw_rectangle(sw - fade, 0.0, fade, sh, Color::new(0.02, 0.02, 0.05, 0.4));
 
-        let Some((speaker_key, text_key)) = self.scene.page.clone() else { return };
+        let Some((speaker, line)) = self.scene.page.clone() else { return };
 
         let bw = sw * 0.76;
         let bh = 192.0;
         let bx = (sw - bw) * 0.5;
         let by = sh - bh - 34.0;
         theme::draw_panel(bx, by, bw, bh);
-
-        let speaker = self.loc.t(&speaker_key);
-        let line = self.loc.t(&text_key);
 
         self.fonts.text(&speaker, bx + 30.0, by - 16.0, 32.0, theme::CURSOR);
         draw_rectangle(
@@ -698,7 +697,7 @@ impl App {
             theme::CURSOR,
         );
 
-        // typewriter over the localized text (switch languages freely)
+        // typewriter over the script's own text (YAML carries the copy per locale)
         let total = line.chars().count();
         let shown: String = line.chars().take((self.scene.chars_shown as usize).min(total)).collect();
         self.fonts.text(&shown, bx + 34.0, by + 78.0, 30.0, theme::INK);

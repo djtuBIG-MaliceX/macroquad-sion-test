@@ -12,9 +12,6 @@ title.hint = ↑↓ Select   Enter / Z Decide   Esc Exit
 footer.engine = libSiON-rs {0} - one streaming driver: looping title theme + live SFX
 
 dialogue.hint = Enter / Z Advance    Esc Back
-speaker.aria = Aria
-line.prologue.1 = The tower bells stopped ringing at dusk...
-line.prologue.2 = Will you walk with me to the old gate?
 
 load.title = Load Game
 load.subtitle = Save Data

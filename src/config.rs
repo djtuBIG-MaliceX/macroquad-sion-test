@@ -72,11 +72,14 @@ pub async fn title_mml() -> Result<String, String> {
     load_asset_text(TITLE_THEME_PATH).await
 }
 
-/// Load one audio asset and classify it by flavour: SiMML text for MML-ish
+/// Load one audio asset and classify it by flavour: MIDI files as raw
+/// bytes (parsed by the [`crate::audio::midi`] bus), SiMML text for MML-ish
 /// extensions, raw container bytes (decoded later by the `samples` bus via
 /// macroquad — wav/ogg/mp3…) for everything else.
 pub async fn load_audio_asset(path: &str) -> Result<crate::audio::AudioAsset, String> {
-    if crate::audio::samples::is_sample_path(path) {
+    if crate::audio::midi::is_midi_path(path) {
+        Ok(crate::audio::AudioAsset::Midi(load_asset_bytes(path).await?))
+    } else if crate::audio::samples::is_sample_path(path) {
         Ok(crate::audio::AudioAsset::Bytes(load_asset_bytes(path).await?))
     } else {
         Ok(crate::audio::AudioAsset::Mml(load_asset_text(path).await?))

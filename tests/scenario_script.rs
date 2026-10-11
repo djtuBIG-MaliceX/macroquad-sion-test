@@ -1,7 +1,8 @@
 //! The scenario scripting contract: the shipped YAML scripts must parse
 //! into the full command vocabulary, locale-suffixed variants must exist
-//! and parse too, and audio paths must route to the right bus (SiMML on
-//! the driver, sampled files on the macroquad `samples` bus).
+//! and parse too, dialogue is literal copy carried by each locale's YAML,
+//! and audio paths must route to the right bus (SiMML on the driver,
+//! .mid on reserved tracks, sampled files on the macroquad `samples` bus).
 
 use std::fs;
 use std::path::Path;
@@ -29,7 +30,7 @@ fn prologue_scripts_the_full_command_vocabulary() {
     for cmd in &script.commands {
         match cmd {
             Command::Dialog { speaker, text } => {
-                assert!(!speaker.is_empty() && !text.is_empty(), "dialog needs keys");
+                assert!(!speaker.is_empty() && !text.is_empty(), "dialog needs speaker + text");
                 saw_dialogue = true;
             }
             Command::Music(r) => {
@@ -71,9 +72,30 @@ fn prologue_scripts_the_full_command_vocabulary() {
     let last = script.commands.last().expect("non-empty program");
     assert!(matches!(last, Command::Next), "example scenario ends with `next` (back to title)");
 
+    // Dialogue is literal copy carried by the YAML itself (the runner reads
+    // it straight out of the command — no .loc keys are involved).
+    let dialogue: Vec<(&str, &str)> = script
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            Command::Dialog { speaker, text } => Some((speaker.as_str(), text.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dialogue,
+        [
+            ("Aria", "The tower bells stopped ringing at dusk..."),
+            ("Aria", "Will you walk with me to the old gate?"),
+        ],
+        "prologue lines must be the script's own English copy"
+    );
+
     // Preload bookkeeping: audio + image paths collected, `scene` excluded.
     let refs = script.asset_refs();
     assert!(refs.music.iter().any(|p| p == "assets/audio/options_theme.mml"));
+    // The MIDI demo routes through the reserved-track engine.
+    assert!(refs.music.iter().any(|p| p == "assets/voice/furina_meets_link.mid"));
     assert!(refs.effects.iter().any(|(p, beats)| p == "assets/sfx/confirm.mml" && *beats > 0.0));
     assert!(refs.images.iter().all(|p| !scenario::is_scene(p)), "scene is engine-drawn");
 }
@@ -81,11 +103,31 @@ fn prologue_scripts_the_full_command_vocabulary() {
 #[test]
 fn locale_suffixed_scenario_parses() {
     // `<base>.<locale>.yaml` is picked by config::load_scenario at runtime;
-    // here: the shipped Japanese variant must be valid on its own terms.
+    // here: the shipped Japanese variant must be valid on its own terms,
+    // carrying its own literal (translated) dialogue copy.
     let script = Scenario::parse(&read("assets/scenario/prologue.ja.yaml"));
     assert!(!script.commands.is_empty(), "ja variant stages commands");
     let last = script.commands.last().unwrap();
     assert!(matches!(last, Command::Next), "locale variant also ends with `next`");
+
+    let dialogue: Vec<(&str, &str)> = script
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            Command::Dialog { speaker, text } => Some((speaker.as_str(), text.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dialogue,
+        [("アリア", "塔の鐘が止まったのは、夕暮れ……"), ("アリア", "古い正門まで、付いてきてくれる？")],
+        "ja variant stages its own translated lines"
+    );
+    assert!(script
+        .asset_refs()
+        .music
+        .iter()
+        .any(|p| p == "assets/voice/furina_meets_link.mid"));
 }
 
 #[test]

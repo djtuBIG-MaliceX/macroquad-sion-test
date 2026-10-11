@@ -10,9 +10,10 @@
 //!
 //! Locale selection lives in [`crate::config::load_scenario`]: a script
 //! base name resolves to `<base>.<locale>.yaml` first, then the default
-//! (English) `<base>.yaml`. Dialogue `speaker`/`text` stay l10n keys that
-//! resolve through the active locale at presentation time, so language
-//! switching re-voices every scripted line.
+//! (English) `<base>.yaml`. Dialogue `speaker`/`text` are literal copy
+//! carried by each locale's YAML (swap the whole script file to switch
+//! language), so no `.loc` keys are involved — the runner reads the text
+//! straight out of [`Command::Dialog`].
 
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -27,7 +28,7 @@ pub struct Scenario {
 #[derive(Debug, Clone)]
 pub enum Command {
     /// Stage a line in the dialogue box; execution pauses until the
-    /// player advances (both fields are l10n keys).
+    /// player advances (both fields are literal text from the YAML).
     Dialog { speaker: String, text: String },
 
     /// Switch the looping music track (restart from the top).

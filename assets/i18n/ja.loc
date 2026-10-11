@@ -12,9 +12,6 @@ title.hint = ↑↓ 選択   Enter / Z 決定   Esc 戻る
 footer.engine = libSiON-rs {0} —— 単一のストリーミング駆動：タイトル曲ループ + ライブSE
 
 dialogue.hint = Enter / Z 進む    Esc 戻る
-speaker.aria = アリア
-line.prologue.1 = 塔の鐘が止まったのは、夕暮れ……
-line.prologue.2 = 古い正門まで、付いてきてくれる？
 
 load.title = ロード
 load.subtitle = セーブデータ

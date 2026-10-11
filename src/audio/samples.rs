@@ -29,7 +29,7 @@ thread_local! {
 
 /// True for extensions the sampled bus owns (everything else is SiMML).
 pub fn is_sample_path(path: &str) -> bool {
-    path.rsplit('.').next().is_some_and(|ext| SAMPLE_EXTS.iter().any(|s| s.eq_ignore_ascii_case(ext)))
+    path.rsplit_once('.').is_some_and(|(_, ext)| SAMPLE_EXTS.iter().any(|s| s.eq_ignore_ascii_case(ext)))
 }
 
 /// True when `path` was decoded and banked by [`register`].
@@ -53,10 +53,20 @@ fn lookup(path: &str) -> Option<mq::Sound> {
     BANK.with(|b| b.borrow().get(path).cloned())
 }
 
+/// The looping track's path, if any (for same-track restart guards).
+pub fn current_music() -> Option<String> {
+    MUSIC.with(|m| m.borrow().clone())
+}
+
 /// Loop `path` from the top; returns false (silence) when it was never
-/// registered. The previous looping track — sampled or not, from the
-/// facade's perspective — is stopped first so switches are clean.
+/// registered. A request for the already-looping track is a no-op (screen
+/// switches replay their theme; only an actual change restarts). The
+/// previous looping track — sampled or not, from the facade's perspective —
+/// is stopped first so switches are clean.
 pub fn play_music(path: &str) -> bool {
+    if current_music().as_deref() == Some(path) {
+        return true; // already sounding: keep playing (no restart)
+    }
     stop_music();
 
     let Some(sound) = lookup(path) else {

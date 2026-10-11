@@ -2,13 +2,15 @@
 #
 # The active locale picks `prologue.<locale>.yaml` when present (e.g.
 # `prologue.ja.yaml`) and falls back to this default (English) file.
-# Dialogue `speaker`/`text` stay l10n keys resolved through
-# assets/i18n/*.loc, so the language option still re-voices every line.
+# Dialogue `speaker`/`text` are literal copy carried by this file —
+# each locale's YAML holds its own translated lines, and the runner
+# reads them straight out of the script (no assets/i18n/*.loc keys).
 #
 # Commands run top to bottom:
 #   dialog: {speaker, text}        stage a line; waits for Enter/Z to advance
-#   music:  <path|{file}>          switch song (SiMML / .ogg / .wav;
-#                                  .mp3 decodes in browsers only), plays from top
+#   music:  <path|{file}>          switch song (SiMML / .mid / .ogg / .wav;
+#                                  .mp3 decodes in browsers only). Restarting
+#                                  only happens when the path actually changes
 #   sfx:    <path|{file, beats}>   one-shot effect (same formats)
 #   image:  <path|{file, name, appear, seconds, x, y, w, h}>
 #                                  `scene` = generated placeholder backdrop;
@@ -21,6 +23,8 @@
 commands:
   - image: { file: scene, appear: instant }
 
+  # starts the title theme (or keeps it running untouched if it is
+  # already the current track — no restart on a same-path switch)
   - music: assets/audio/options_theme.mml
 
   - sfx: assets/sfx/confirm.mml
@@ -29,15 +33,19 @@ commands:
   - sfx: assets/sfx/voice_cue.ogg
 
   - dialog:
-      speaker: speaker.aria
-      text: line.prologue.1
+      speaker: Aria
+      text: The tower bells stopped ringing at dusk...
 
   - wait: 0.35
   - shake: { strength: 9, seconds: 0.5 }
 
+  # MIDI demo: General MIDI SMF rendered live on reserved libSiON
+  # tracks (GM presets, per-channel pitch bend + expression)
+  - music: assets/voice/furina_meets_link.mid
+
   - dialog:
-      speaker: speaker.aria
-      text: line.prologue.2
+      speaker: Aria
+      text: Will you walk with me to the old gate?
 
   - animate: { target: scene, to: [640, 150], seconds: 1.2 }
   - wait: 1.4

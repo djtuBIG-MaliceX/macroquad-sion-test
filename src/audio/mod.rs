@@ -11,7 +11,17 @@
 //! [`sfx_file`] façade routes by file extension so screens and scenario
 //! scripts address both backends with one vocabulary, and volume/fade
 //! helpers keep the two buses moving together.
+//!
+//! MIDI files (`assets/**.mid`) form a third route: [`midi`] parses the
+//! SMF and streams it through driver tracks reserved for the app (bends,
+//! expression and per-channel GM voices included), pumped in step with the
+//! driver blocks.
+//!
+//! Music continuity: whatever owns the music bus, replaying the track that
+//! is already sounding is a no-op — screen switches re-request their theme
+//! every time, and only an actual track change restarts playback.
 
+pub mod midi;
 pub mod samples;
 pub mod sfx;
 
@@ -26,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use libsion::core::core as sion;
 use libsion::{DriverEvent, SiONData, SiONDriver};
 
+pub use midi::{MidiPlayer, MidiSong};
 pub use sfx::{SfxBank, SfxId};
 
 pub const SAMPLE_RATE: i32 = 44100;
@@ -38,6 +49,9 @@ pub const BLOCK_FRAMES: usize = 2048;
 pub enum AudioAsset {
     /// SiMML source text (`*.mml`): compiled onto the driver.
     Mml(String),
+    /// Standard MIDI File bytes (`*.mid/.midi`): parsed, played on
+    /// reserved tracks (see [`midi`]).
+    Midi(Vec<u8>),
     /// Compressed/PCM container bytes: decoded by `macroquad::audio`.
     Bytes(Vec<u8>),
 }
@@ -69,6 +83,10 @@ pub struct AudioEngine {
     song_order: Vec<String>,
     /// Scenario-referenced MML one-shots (path → data + max length).
     file_effects: HashMap<String, (Rc<RefCell<SiONData>>, f64)>,
+    /// Parsed MIDI songs keyed by asset path (played on reserved tracks).
+    midi_songs: HashMap<String, Rc<MidiSong>>,
+    /// Live MIDI playback, if the current music is a `.mid` file.
+    midi: Option<MidiPlayer>,
     current_music: RefCell<Option<String>>,
 
     /// Output level applied after the driver, so an exit fade sweeps every
@@ -120,6 +138,8 @@ impl AudioEngine {
             songs: HashMap::new(),
             song_order: Vec::new(),
             file_effects: HashMap::new(),
+            midi_songs: HashMap::new(),
+            midi: None,
             current_music: RefCell::new(None),
             master: Cell::new(1.0),
             master_step: Cell::new(0.0),
@@ -138,6 +158,18 @@ impl AudioEngine {
         }
     }
 
+    /// Register a parsed MIDI song under its asset path. Parse-only: no
+    /// `compile()` (which would stop the live stream), so `.mid` files can
+    /// be registered mid-session safely too.
+    pub fn add_midi_song(&mut self, path: &str, bytes: &[u8]) {
+        match MidiSong::parse(bytes) {
+            Ok(song) => {
+                self.midi_songs.insert(path.to_string(), Rc::new(song));
+            }
+            Err(e) => eprintln!("midi asset '{path}' unparseable: {e}"),
+        }
+    }
+
     /// Register scenario-referenced MML one-shot; `beats` bounds the
     /// `sequence_on` window (16th-note beats, cf. [`SfxId::max_length`]).
     pub fn add_effect_mml(&mut self, path: &str, mml: String, beats: f64) {
@@ -145,10 +177,22 @@ impl AudioEngine {
         self.file_effects.insert(path.to_string(), (data, beats.max(1.0)));
     }
 
-    /// Start (or restart from the top) the registered SiMML track for
-    /// `path`. Unknown/missing tracks mean silence: nothing is substituted.
-    /// Sampled files belong to [`samples`] — go through [`play_track`].
+    /// Start (or restart from the top) the registered SiMML/MIDI track for
+    /// `path` — unless that very track is already sounding: screen switches
+    /// replay their screen theme, and a restart there would be the old
+    /// stutter; only an actual track change restarts from zero. Unknown/
+    /// missing tracks mean silence: nothing is substituted. Sampled files
+    /// belong to [`samples`] — go through [`play_track`].
     pub fn play_music(&mut self, path: &str) {
+        if self.current_music.borrow().as_deref() == Some(path) && self.driver.is_streaming() {
+            return; // already sounding: keep playing (no restart)
+        }
+
+        // Whatever played before leaves the stage now; a live MIDI player
+        // drops with its reserved tracks inside the coming `stream()`.
+        self.midi = None;
+        self.driver.set_auto_stop(true);
+
         if let Some(data) = self.songs.get(path).cloned() {
             *self.current_music.borrow_mut() = Some(path.to_string());
             self.state.song_finished.set(false);
@@ -156,6 +200,18 @@ impl AudioEngine {
             // fresh tracks next block -> re-capture their authored gain
             self.music_base.borrow_mut().clear();
             self.driver.play(&data, true);
+        } else if let Some(song) = self.midi_songs.get(path).cloned() {
+            *self.current_music.borrow_mut() = Some(path.to_string());
+            self.state.song_finished.set(false);
+            self.loop_music.set(true);
+            self.music_base.borrow_mut().clear();
+            // Silent gaps between MIDI notes would trip the auto-stop (all
+            // reserved tracks report finished), so streaming is held open.
+            self.driver.set_auto_stop(false);
+            // `stream` frees every track (MML included), then the player
+            // reserves fresh USER_CONTROLLED tracks on the empty stage.
+            self.driver.stream(true);
+            self.midi = Some(MidiPlayer::start(&mut self.driver, song));
         } else {
             eprintln!("music asset '{path}' unavailable - silence");
             *self.current_music.borrow_mut() = None;
@@ -176,9 +232,11 @@ impl AudioEngine {
         self.current_music.borrow().clone()
     }
 
-    /// True when the given path is registered as a compiled song.
+    /// True when the given path is registered as a compiled or MIDI song.
     pub fn has_track(&self, path: &str) -> bool {
-        self.songs.contains_key(path) || self.file_effects.contains_key(path)
+        self.songs.contains_key(path)
+            || self.file_effects.contains_key(path)
+            || self.midi_songs.contains_key(path)
     }
 
     /// Silence future music loops; keeps any scheduled tail audible.
@@ -280,6 +338,16 @@ impl AudioEngine {
     /// one unconditional driver step, so file-SFX-only sessions (no music
     /// registered at all) still advance the chip.
     fn pump_sequencer(&mut self) {
+        // MIDI playback drives reserved tracks directly: pump it per block
+        // (note scheduling + realtime controls + CC7×gain volumes) and skip
+        // the MML loop/baseline machinery entirely — `music_tracks()` only
+        // enumerates compiled-song tracks, which a MIDI stream has none of.
+        if let Some(player) = self.midi.as_mut() {
+            player.tick(&mut self.driver, self.music_gain.get());
+            self.driver.update();
+            return;
+        }
+
         let current_is_song = self.current_music.borrow().as_deref().is_some_and(|p| self.songs.contains_key(p));
         if current_is_song
             && self.loop_music.get()
@@ -434,16 +502,34 @@ impl AudioEngine {
     pub fn total_track_count(&self) -> i32 {
         self.driver.get_track_count()
     }
+
+    /// Reserved MIDI playback tracks currently live (0 when nothing plays).
+    /// MIDI tracks are `USER_CONTROLLED`, never `MML_TRACK`, so they do not
+    /// show up in [`Self::music_track_master_volumes`].
+    #[doc(hidden)]
+    pub fn midi_track_count(&self) -> usize {
+        self.midi.as_ref().map_or(0, |p| p.track_count())
+    }
+
+    /// Engine audio clock in processed samples. Test observability for the
+    /// no-restart music guard: `play`/`stream` reset it to zero, a same-path
+    /// replay (the guard) lets it keep rising.
+    #[doc(hidden)]
+    pub fn processed_sample_count(&self) -> i64 {
+        self.driver.sequencer.borrow().get_processed_sample_count() as i64
+    }
 }
 
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         // Release every arena-backed consumer (compiled songs, bank data,
-        // the event closure) before `sion::finalize()` kills statics; the
-        // binary must drain native output BEFORE dropping.
+        // MIDI tracks/songs, the event closure) before `sion::finalize()`
+        // kills statics; the binary must drain native output BEFORE dropping.
         self.stop_music_looping();
+        self.midi = None;
         self.songs.clear();
         self.file_effects.clear();
+        self.midi_songs.clear();
         *self.current_music.borrow_mut() = None;
         self.sfx_bank.clear_compiled();
         self.driver.on_event = None;
@@ -516,8 +602,11 @@ thread_local! {
 
 impl AudioEngine {
     /// Immediately kill any streaming song (looping already disabled); used
-    /// when a sampled track takes over the music bus.
+    /// when a sampled track takes over the music bus. A live MIDI player
+    /// drops with it — its reserved tracks die on the next `stream()`.
     fn driver_hush(&mut self) {
+        self.midi = None;
+        self.driver.set_auto_stop(true);
         *self.current_music.borrow_mut() = None;
         self.music_base.borrow_mut().clear();
         self.driver.stop();
