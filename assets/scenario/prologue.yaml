@@ -11,7 +11,10 @@
 #   music:  <path|{file}>          switch song (SiMML / .mid / .ogg / .wav;
 #                                  .mp3 decodes in browsers only). Restarting
 #                                  only happens when the path actually changes
-#   sfx:    <path|{file, beats}>   one-shot effect (same formats)
+#   sfx:    <path|{file, beats}>   one-shot effect (same formats; a .mid plays
+#                                  its whole length on reserved tracks *over*
+#                                  whatever music is playing - `beats` only
+#                                  bounds MML cues)
 #   image:  <path|{file, name, appear, seconds, x, y, w, h}>
 #                                  `scene` = generated placeholder backdrop;
 #                                  appear: fade (default) | instant
@@ -40,14 +43,16 @@ commands:
   - shake: { strength: 9, seconds: 0.5 }
 
   # MIDI demo: General MIDI SMF rendered live on reserved libSiON
-  # tracks (GM presets, per-channel pitch bend + expression)
-  - music: assets/voice/furina_meets_link.mid
+  # tracks (GM presets, per-channel pitch bend + expression). As an `sfx:`
+  # it plays once *on top of* the theme that is already running, at the SFX
+  # level - a voice-act cue rather than a music-bus takeover.
+  - sfx: assets/voice/furina_meets_link.mid
 
   - dialog:
       speaker: Aria
       text: Will you walk with me to the old gate?
 
   - animate: { target: scene, to: [640, 150], seconds: 1.2 }
-  - wait: 1.4
+  - wait: 6.0
 
   - next

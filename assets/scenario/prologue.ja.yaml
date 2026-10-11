@@ -19,8 +19,9 @@ commands:
   - shake: { strength: 6, seconds: 0.8 }
   - sfx: assets/sfx/confirm.mml
 
-  # MIDI demo: General MIDI SMF rendered live on reserved libSiON tracks
-  - music: assets/voice/furina_meets_link.mid
+  # MIDI demo: General MIDI SMF rendered live on reserved libSiON tracks.
+  # As an `sfx:` it plays once over the theme that is already running.
+  - sfx: assets/voice/furina_meets_link.mid
 
   - dialog:
       speaker: アリア

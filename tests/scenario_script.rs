@@ -94,8 +94,16 @@ fn prologue_scripts_the_full_command_vocabulary() {
     // Preload bookkeeping: audio + image paths collected, `scene` excluded.
     let refs = script.asset_refs();
     assert!(refs.music.iter().any(|p| p == "assets/audio/options_theme.mml"));
-    // The MIDI demo routes through the reserved-track engine.
-    assert!(refs.music.iter().any(|p| p == "assets/voice/furina_meets_link.mid"));
+    // The MIDI demo is an SFX cue now: preloaded with the effects and never on
+    // the music bus, which is what keeps it from taking the theme away.
+    assert!(refs
+        .effects
+        .iter()
+        .any(|(p, _)| p == "assets/voice/furina_meets_link.mid"));
+    assert!(
+        refs.music.iter().all(|p| !p.ends_with(".mid")),
+        "shipped prologue keeps every .mid off the music bus"
+    );
     assert!(refs.effects.iter().any(|(p, beats)| p == "assets/sfx/confirm.mml" && *beats > 0.0));
     assert!(refs.images.iter().all(|p| !scenario::is_scene(p)), "scene is engine-drawn");
 }
@@ -125,9 +133,9 @@ fn locale_suffixed_scenario_parses() {
     );
     assert!(script
         .asset_refs()
-        .music
+        .effects
         .iter()
-        .any(|p| p == "assets/voice/furina_meets_link.mid"));
+        .any(|(p, _)| p == "assets/voice/furina_meets_link.mid"));
 }
 
 #[test]

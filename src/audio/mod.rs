@@ -12,10 +12,13 @@
 //! scripts address both backends with one vocabulary, and volume/fade
 //! helpers keep the two buses moving together.
 //!
-//! MIDI files (`assets/**.mid`) form a third route: [`midi`] parses the
-//! SMF and streams it through driver tracks reserved for the app (bends,
-//! expression and per-channel GM voices included), pumped in step with the
-//! driver blocks.
+//! MIDI files (`assets/**.mid`) form a third route: [`midi`] parses the SMF
+//! and performs it on driver tracks reserved for the app (bends, expression
+//! and per-channel GM voices included), pumped in step with the driver blocks.
+//! Like everything else they are chosen by extension through [`play_track`]
+//! and [`sfx_file`], which puts them on either bus: as music they own the
+//! stream and loop, as an effect they play once at the SFX level *over*
+//! whatever music is already sounding and hand their tracks back when silent.
 //!
 //! Music continuity: whatever owns the music bus, replaying the track that
 //! is already sounding is a no-op — screen switches re-request their theme
@@ -64,6 +67,20 @@ struct StreamState {
     song_finished: Cell<bool>,
 }
 
+/// One live `.mid` cue on the SFX bus: its reserved tracks plus the level it
+/// was triggered at (the live SFX slider), so cues keep their own mix while
+/// the music bus carries on underneath.
+struct MidiEffect {
+    path: String,
+    player: MidiPlayer,
+    gain: f32,
+}
+
+/// Concurrent `.mid` cue cap. Each cue reserves one track per melodic channel,
+/// so a runaway script cannot out-allocate the driver's track budget; the
+/// oldest cue is cut when a new one would exceed it.
+const MAX_MIDI_EFFECTS: usize = 3;
+
 pub struct AudioEngine {
     driver: SiONDriver,
     scratch: Vec<f32>,
@@ -87,6 +104,12 @@ pub struct AudioEngine {
     midi_songs: HashMap<String, Rc<MidiSong>>,
     /// Live MIDI playback, if the current music is a `.mid` file.
     midi: Option<MidiPlayer>,
+    /// One-shot `.mid` cues (SFX bus) sounding over whatever the music bus is
+    /// doing; each owns its own reserved tracks until it goes silent.
+    midi_effects: Vec<MidiEffect>,
+    /// True while the cues alone are keeping the driver streaming (nothing on
+    /// the music bus needed a stream), so they can close it again themselves.
+    effects_own_stream: Cell<bool>,
     current_music: RefCell<Option<String>>,
 
     /// Output level applied after the driver, so an exit fade sweeps every
@@ -140,6 +163,8 @@ impl AudioEngine {
             file_effects: HashMap::new(),
             midi_songs: HashMap::new(),
             midi: None,
+            midi_effects: Vec::new(),
+            effects_own_stream: Cell::new(false),
             current_music: RefCell::new(None),
             master: Cell::new(1.0),
             master_step: Cell::new(0.0),
@@ -188,9 +213,13 @@ impl AudioEngine {
             return; // already sounding: keep playing (no restart)
         }
 
-        // Whatever played before leaves the stage now; a live MIDI player
-        // drops with its reserved tracks inside the coming `stream()`.
-        self.midi = None;
+        // Whatever played before leaves the stage now, and the `stream`/`play`
+        // below frees every track — so reserved-track owners hand theirs back
+        // first (which is also what keeps a repeated cue from leaking slots).
+        if let Some(player) = self.midi.take() {
+            player.release(&mut self.driver);
+        }
+        self.stop_midi_effects();
         self.driver.set_auto_stop(true);
 
         if let Some(data) = self.songs.get(path).cloned() {
@@ -295,13 +324,19 @@ impl AudioEngine {
         self.sfx_bank.play(&mut self.driver, id, sfx_gain);
     }
 
-    /// One-shot MML effect referenced by asset path: bank ids route to
+    /// One-shot MML or MIDI effect referenced by asset path: bank ids route to
     /// their precompiled entry, scenario MML files use their registration
-    /// window. Sampled paths never reach this — [`sfx_file`] splits first,
-    /// and unknown paths stay silent (a warning is printed).
+    /// window, `.mid` files play once on reserved tracks (their own length
+    /// decides — `beats` is an MML notion). Sampled paths never reach this —
+    /// [`sfx_file`] splits first, and unknown paths stay silent (a warning is
+    /// printed).
     pub fn play_file_sfx(&mut self, path: &str, sfx_gain: f32) {
         if let Some(id) = self.sfx_bank.id_for_path(path) {
             self.play_sfx(id, sfx_gain);
+            return;
+        }
+        if let Some(song) = self.midi_songs.get(path).cloned() {
+            self.play_midi_effect(path, song, sfx_gain);
             return;
         }
         if let Some((data, beats)) = self.file_effects.get(path).cloned() {
@@ -316,6 +351,67 @@ impl AudioEngine {
             return;
         }
         eprintln!("sfx asset '{path}' unavailable - skipped");
+    }
+
+    /// Fire a `.mid` cue on the SFX bus: one pass of the file at `sfx_gain`,
+    /// while whatever is on the music bus keeps playing. Nothing here calls
+    /// `stream`/`play`, so the running song is untouched; only when the driver
+    /// sits idle does the cue open a stream for itself (with auto-stop off —
+    /// silent gaps between its notes would otherwise end it early). Firing a
+    /// cue that is still sounding restarts it, like any other effect.
+    fn play_midi_effect(&mut self, path: &str, song: Rc<MidiSong>, sfx_gain: f32) {
+        self.cut_effects(|fx| fx.path == path); // retrigger wins over its old pass
+        self.evict_oldest_effect();
+
+        if !self.driver.is_streaming() {
+            self.effects_own_stream.set(true);
+            self.driver.set_auto_stop(false);
+            self.driver.stream(true);
+        }
+        // Reserving needs a live stream. The cue then counts its own blocks,
+        // so neither the song's playing position nor a loop restart shifts it.
+        let player = MidiPlayer::once(&mut self.driver, song);
+        self.midi_effects.push(MidiEffect { path: path.to_string(), player, gain: sfx_gain });
+    }
+
+    /// Drop cues matching `pick`, handing their tracks back to the pool.
+    fn cut_effects(&mut self, pick: impl Fn(&MidiEffect) -> bool) {
+        let cues = std::mem::take(&mut self.midi_effects);
+        let (keep, cut): (Vec<_>, Vec<_>) = cues.into_iter().partition(|fx| !pick(fx));
+        self.midi_effects = keep;
+        for cue in cut {
+            cue.player.release(&mut self.driver);
+        }
+        if self.midi_effects.is_empty() {
+            self.close_effect_stream();
+        }
+    }
+
+    /// Cap the polyphony of cues: the oldest one gives up its tracks.
+    fn evict_oldest_effect(&mut self) {
+        if self.midi_effects.len() >= MAX_MIDI_EFFECTS {
+            let cue = self.midi_effects.remove(0);
+            cue.player.release(&mut self.driver);
+        }
+    }
+
+    /// Every cue off (the music bus is changing over, or the engine is going
+    /// away): releases the tracks and forgets any stream they opened.
+    fn stop_midi_effects(&mut self) {
+        let cues = std::mem::take(&mut self.midi_effects);
+        for cue in cues {
+            cue.player.release(&mut self.driver);
+        }
+        self.effects_own_stream.set(false);
+    }
+
+    /// Cues that started the driver for themselves close it again, so a
+    /// script with no music on this bus does not leave it rendering silence.
+    fn close_effect_stream(&mut self) {
+        if self.midi_effects.is_empty() && self.effects_own_stream.take() {
+            self.driver.set_auto_stop(true);
+            self.driver.stop();
+        }
     }
 
     /// Programmatic pitch-following click for sliders (0.0..=1.0).
@@ -333,11 +429,43 @@ impl AudioEngine {
         self.master_step.set(-1.0 / (secs * SAMPLE_RATE as f32));
     }
 
+    /// One block of every live `.mid` cue: scheduling at its own SFX level,
+    /// then handing back the cues whose pass has gone fully silent. The music
+    /// bus is not involved — that keeps pumping in `pump_sequencer`.
+    fn pump_midi_effects(&mut self) {
+        if self.midi_effects.is_empty() {
+            return;
+        }
+        // A stopped driver renders nothing, so its clock simply waits; the
+        // players' block-counting clocks resume in step when the bus restarts
+        // (a song loop resetting the driver counter reads as one more block).
+        if self.driver.is_streaming() {
+            for cue in &mut self.midi_effects {
+                let gain = cue.gain;
+                cue.player.tick(&mut self.driver, gain);
+            }
+        }
+
+        let cues = std::mem::take(&mut self.midi_effects);
+        let (keep, done): (Vec<_>, Vec<_>) = cues.into_iter().partition(|c| !c.player.is_finished());
+        self.midi_effects = keep;
+        for cue in done {
+            cue.player.release(&mut self.driver);
+        }
+        if self.midi_effects.is_empty() {
+            self.close_effect_stream();
+        }
+    }
+
     /// Advance the sequencer once per rendered block; re-`play` the
     /// (precompiled) current song when its loop window rolls over. Also the
     /// one unconditional driver step, so file-SFX-only sessions (no music
     /// registered at all) still advance the chip.
     fn pump_sequencer(&mut self) {
+        // SFX-bus cues ride whatever stream exists (the music bus or their
+        // own), so they are pumped ahead of both music branches.
+        self.pump_midi_effects();
+
         // MIDI playback drives reserved tracks directly: pump it per block
         // (note scheduling + realtime controls + CC7×gain volumes) and skip
         // the MML loop/baseline machinery entirely — `music_tracks()` only
@@ -490,6 +618,24 @@ impl AudioEngine {
         std::mem::swap(&mut self.scratch, &mut buf);
     }
 
+    /// Like [`Self::pump_for_test`] but hands back the rendered (interleaved)
+    /// samples so tests can measure what is actually audible — e.g. that a
+    /// control change really scales the channel, not just a track field.
+    #[doc(hidden)]
+    pub fn pump_capture(&mut self, blocks: usize) -> Vec<f32> {
+        let frames = BLOCK_FRAMES * CHANNELS;
+        let mut out = Vec::with_capacity(blocks * frames);
+        let mut buf = std::mem::take(&mut self.scratch);
+        for _ in 0..blocks {
+            self.pump_sequencer();
+            self.driver.render_chunk(&mut buf[..frames]);
+            self.apply_master(&mut buf[..frames]);
+            out.extend_from_slice(&buf[..frames]);
+        }
+        std::mem::swap(&mut self.scratch, &mut buf);
+        out
+    }
+
     /// Live music-track master volumes (post-gain); empty until a baseline
     /// exists. Exposed so tests can assert music-only scaling.
     #[doc(hidden)]
@@ -509,6 +655,20 @@ impl AudioEngine {
     #[doc(hidden)]
     pub fn midi_track_count(&self) -> usize {
         self.midi.as_ref().map_or(0, |p| p.track_count())
+    }
+
+    /// Reserved `.mid` cue tracks currently live on the SFX bus (0 when no
+    /// cue is sounding). Kept separate from [`Self::midi_track_count`], which
+    /// only reports the music-bus player.
+    #[doc(hidden)]
+    pub fn midi_effect_track_count(&self) -> usize {
+        self.midi_effects.iter().map(|c| c.player.track_count()).sum()
+    }
+
+    /// Paths of the `.mid` cues still sounding, oldest first.
+    #[doc(hidden)]
+    pub fn midi_effect_paths(&self) -> Vec<String> {
+        self.midi_effects.iter().map(|c| c.path.clone()).collect()
     }
 
     /// Engine audio clock in processed samples. Test observability for the
@@ -605,7 +765,10 @@ impl AudioEngine {
     /// when a sampled track takes over the music bus. A live MIDI player
     /// drops with it — its reserved tracks die on the next `stream()`.
     fn driver_hush(&mut self) {
-        self.midi = None;
+        if let Some(player) = self.midi.take() {
+            player.release(&mut self.driver);
+        }
+        self.stop_midi_effects();
         self.driver.set_auto_stop(true);
         *self.current_music.borrow_mut() = None;
         self.music_base.borrow_mut().clear();

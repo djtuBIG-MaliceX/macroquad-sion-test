@@ -34,7 +34,9 @@ pub enum Command {
     /// Switch the looping music track (restart from the top).
     Music(MusicSpec),
 
-    /// Fire a one-shot effect. `beats` bounds the MML sequence window.
+    /// Fire a one-shot effect. `beats` bounds the MML sequence window; a
+    /// `.mid` cue instead plays its whole length on reserved tracks, mixed in
+    /// at the SFX level while the current music keeps playing.
     Sfx(SfxSpec),
 
     /// Add a layer to the stage (backgrounds first is the convention).

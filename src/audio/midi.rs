@@ -31,9 +31,17 @@
 //! scope, as are tempo changes after the first, CC64+ controllers and
 //! >1-note polyphony per channel.
 //!
-//! Reserved tracks survive screen switches: the engine only drops the
-//! player when a different track starts, and reservations happen after
-//! `driver.stream(true)` because `prepare_process` frees every track.
+//! Two buses, one player: [`PlayMode::Loop`] owns the music bus (reserved
+//! after `driver.stream(true)`, loops forever), [`PlayMode::Once`] is a
+//! one-shot cue that joins a stream which is *already* running — so a `.mid`
+//! can sound like any other SFX over continuing music. Cues therefore keep
+//! their own block-counted clock instead of reading the driver's absolute
+//! sample count, which song loops reset to zero under them.
+//!
+//! Reserved tracks are handed back with [`MidiPlayer::release`] (key off +
+//! `set_disposable`): a non-disposable `USER_CONTROLLED` track stays in the
+//! pool forever and is never re-handed-out, so releasing is what keeps a
+//! repeatedly triggered cue from exhausting the track budget.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -50,7 +58,28 @@ const DEFAULT_BEND_RANGE: f32 = 2.0;
 /// GM drum channel index: parsed for completeness, skipped at playback.
 const DRUM_CHANNEL: u8 = 9;
 /// Velocity→track-velocity scale (`set_velocity` spans 0..512, MIDI 1..127).
-const VELOCITY_SCALE: f32 = 4.0;
+///
+/// Only the low half of SiON's velocity table is usable: `ref_table` builds
+/// `v(0..=256)` as a linear gain ramp and `v(257..=512)` as a clamped
+/// "distortion" boost. Scaling by 4 (MIDI 127 → 508) parked every note in
+/// that clamp, where the total-level ceiling absorbs expression attenuation
+/// — CC11 swells became inaudible. ×2 lands MIDI 127 on the linear maximum
+/// (254), which is what gives expression its full dynamic range back.
+const VELOCITY_SCALE: f32 = 2.0;
+
+/// Top of that linear range; the belt-and-braces ceiling for a scaled MIDI
+/// velocity (MIDI 127 reaches 254 on its own).
+const VELOCITY_MAX: f32 = 256.0;
+
+/// Channel-count mixer exponent for the reserved-track bus.
+///
+/// Every channel is a full-level FM voice on its own track, so an eight-part GM
+/// file sums to roughly `sqrt(n)` times the level of one channel and clips the
+/// master, while a hand-authored SiMML song leaves several dB of headroom. Each
+/// channel is therefore scaled by `n.pow(HEADROOM_EXP)` — gentler than a true
+/// 1/sqrt(n) so a one- or two-channel cue keeps its presence — which lands the
+/// MIDI bus in the same loudness band as the MML themes with room for peaks.
+const HEADROOM_EXP: f32 = -0.35;
 /// CC7→master-volume span (`set_master_volume` spans 0..128, MIDI 0..127).
 const VOLUME_SPAN: f32 = 128.0;
 /// GM CC7 fallback volume when a channel never sends one.
@@ -594,20 +623,42 @@ struct CurrentNote {
     fired: bool,
 }
 
+/// How a player is wired to the driver: the music bus loops forever and owns
+/// the stream; a one-shot cue joins a stream that is already running.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlayMode {
+    /// Music bus: reserved right after `stream(true)`, replays forever.
+    Loop,
+    /// Sound effect: plays the file once over whatever else is sounding,
+    /// then idles until [`MidiPlayer::release`] hands the tracks back.
+    Once,
+}
+
 /// Realtime MIDI playback state: reserved tracks, per-channel GM voice,
-/// the parse streams' cursors and loop bookkeeping. Created via
-/// [`MidiPlayer::start`] (which reserves AFTER the driver stream started)
-/// and pumped once per rendered block through [`MidiPlayer::tick`].
+/// the parse streams' cursors and pass bookkeeping. Created via
+/// [`MidiPlayer::start`] / [`MidiPlayer::once`] (both AFTER the driver stream
+/// started) and pumped once per rendered block through [`MidiPlayer::tick`].
 pub struct MidiPlayer {
     song: Rc<MidiSong>,
     /// Reserved track per channel (same order as `song.channels`).
     tracks: Vec<TrackRc>,
+    mode: PlayMode,
     /// Samples per MIDI tick at the song tempo.
     samples_per_tick: f64,
-    /// Loop length in samples (`length_ticks * samples_per_tick`).
+    /// One pass in samples (`length_ticks * samples_per_tick`).
     song_length_samples: i64,
-    /// Sample offset of the current loop pass (audio-clock domain).
-    loop_base: i64,
+    /// Mixer scale every channel carries (see [`HEADROOM_EXP`]).
+    headroom: f32,
+    /// Audio this player has rendered, in samples — its own monotonic clock.
+    /// The driver's `processed_sample_count` resets to zero when a song loops
+    /// or re-`stream`s, which must not move this player's timeline.
+    played: i64,
+    /// `played` at the start of the current pass.
+    pass_start: i64,
+    /// Driver clock observed at the previous `tick`, to spot rendered blocks.
+    last_clock: i64,
+    /// `Once` only: the pass is over, nothing is armed or applied anymore.
+    ended: bool,
     /// Next unscheduled note index per channel.
     note_cursor: Vec<usize>,
     /// Next unapplied control index per channel.
@@ -621,11 +672,24 @@ pub struct MidiPlayer {
 }
 
 impl MidiPlayer {
-    /// Reserve one track per melodic channel and apply GM voices. Must run
-    /// AFTER the driver stream started: `prepare_process` (inside
-    /// `stream`/`play`) frees every track, so earlier reservations would
-    /// be dropped. The player's loop clock starts at the stream's zero.
+    /// Reserve one track per melodic channel as the looping music bus.
     pub fn start(driver: &mut SiONDriver, song: Rc<MidiSong>) -> MidiPlayer {
+        Self::reserve(driver, song, PlayMode::Loop)
+    }
+
+    /// Reserve one track per melodic channel for a single pass of `song`.
+    /// Safe while another track streams: unlike [`Self::start`] this never
+    /// asks the driver to `stream`, so the music bus keeps playing.
+    pub fn once(driver: &mut SiONDriver, song: Rc<MidiSong>) -> MidiPlayer {
+        Self::reserve(driver, song, PlayMode::Once)
+    }
+
+    /// Reserve the tracks and apply GM voices. Must run AFTER the driver
+    /// stream started: `prepare_process` (inside `stream`/`play`) frees every
+    /// track, so earlier reservations would be dropped. A `Loop` player takes
+    /// the stream's zero clock; a `Once` cue starts counting from wherever
+    /// the host's pump currently is.
+    fn reserve(driver: &mut SiONDriver, song: Rc<MidiSong>, mode: PlayMode) -> MidiPlayer {
         let presets = midi_presets();
         let samples_per_tick = SAMPLE_RATE as f64 * 60.0 / (song.bpm * song.ppq as f64);
 
@@ -651,7 +715,7 @@ impl MidiPlayer {
                     }
                 }
                 tb.set_velocity(0);
-                tb.set_expression(128);
+                tb.set_expression(128); // CC11 at max = full channel volume
                 tb.set_pitch_bend(0);
                 tb.set_master_volume(0); // gain applied per block in `tick`
             }
@@ -660,11 +724,18 @@ impl MidiPlayer {
 
         let channel_total = song.channels.len();
         MidiPlayer {
-            song_length_samples: (song.length_ticks as f64 * samples_per_tick).round() as i64,
+            song_length_samples: (song.length_ticks as f64 * samples_per_tick)
+                .round()
+                .max(1.0) as i64,
+            headroom: (song.channels.len() as f32).powf(HEADROOM_EXP),
             song,
             tracks,
+            mode,
             samples_per_tick,
-            loop_base: 0,
+            played: 0,
+            pass_start: 0,
+            last_clock: driver.sequencer.borrow().get_processed_sample_count() as i64,
+            ended: false,
             note_cursor: vec![0; channel_total],
             control_cursor: vec![0; channel_total],
             current: vec![None; channel_total],
@@ -673,44 +744,86 @@ impl MidiPlayer {
         }
     }
 
-    /// Sample position of one tick event in the current loop pass.
+    /// Sample position of one tick event in the current pass.
     fn event_sample(&self, tick: u32) -> i64 {
-        self.loop_base + (tick as f64 * self.samples_per_tick).round() as i64
+        self.pass_start + (tick as f64 * self.samples_per_tick).round() as i64
     }
 
-    /// Advance everything by one rendered block. `gain` is the music-bus
-    /// level (Options slider); CC7 master volumes ride on top of it.
-    pub fn tick(&mut self, driver: &mut SiONDriver, gain: f32) {
+    /// Fold one pump iteration into the player's own clock. The driver moves
+    /// `processed_sample_count` by exactly one block per processed block and
+    /// freezes it while stopped; a reset (song loop re-`play`, fresh `stream`)
+    /// arrives here as a backwards jump and simply counts as the next block.
+    /// Returns false when no audio was rendered, so callers stay put.
+    fn advance_clock(&mut self, driver: &SiONDriver, block: i64) -> bool {
         let now = driver.sequencer.borrow().get_processed_sample_count() as i64;
-        let block = driver.get_buffer_length() as i64;
+        let delta = now - self.last_clock;
+        self.last_clock = now;
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                self.played += delta.min(block);
+                true
+            }
+            std::cmp::Ordering::Less => {
+                self.played += block;
+                true
+            }
+            std::cmp::Ordering::Equal => false,
+        }
+    }
 
-        // Loop wrap: restart the cursors; bend returns to center so a
-        // loop-end bend cannot detune the next pass; cut ringing tails so
-        // envelopes release instead of droning across the seam.
-        if now >= self.loop_base + self.song_length_samples {
-            self.loop_base += self.song_length_samples;
-            for cursor in &mut self.note_cursor {
-                *cursor = 0;
-            }
-            for cursor in &mut self.control_cursor {
-                *cursor = 0;
-            }
-            for current in &mut self.current {
-                *current = None;
-            }
-            for range in &mut self.bend_ranges {
-                *range = DEFAULT_BEND_RANGE;
-            }
-            for track in &self.tracks {
-                let chip = driver.chip.clone();
-                {
-                    let mut tb = track.borrow_mut();
-                    tb.set_pitch_bend(0);
-                    tb.set_expression(128);
-                    tb.set_velocity(0);
+    /// Pass over and every channel silent? Only true once release tails have
+    /// decayed, so a host can hand its tracks back without cutting a note off.
+    pub fn is_finished(&self) -> bool {
+        self.ended && self.tracks.iter().all(|t| t.borrow().is_finished())
+    }
+
+    /// Advance everything by one rendered block. `gain` is the bus level this
+    /// player performs on (music or SFX slider); CC7 channel volume and CC11
+    /// expression scale it per channel (CC11 at max = 100% of CC7).
+    pub fn tick(&mut self, driver: &mut SiONDriver, gain: f32) {
+        let block = driver.get_buffer_length() as i64;
+        if !self.advance_clock(driver, block) {
+            return; // driver rendered nothing for this player: hold position
+        }
+        let now = self.played;
+
+        // Pass boundary. A loop restarts the cursors, recenters bend so a
+        // loop-end bend cannot detune the next pass, and cuts ringing tails so
+        // envelopes release instead of droning across the seam. A one-shot cue
+        // stops scheduling: every note carries its own length, so the tails
+        // ring out on their own and `is_finished` reports when they are done.
+        if now >= self.pass_start + self.song_length_samples {
+            match self.mode {
+                PlayMode::Once => self.ended = true,
+                PlayMode::Loop => {
+                    self.pass_start += self.song_length_samples;
+                    for cursor in &mut self.note_cursor {
+                        *cursor = 0;
+                    }
+                    for cursor in &mut self.control_cursor {
+                        *cursor = 0;
+                    }
+                    for current in &mut self.current {
+                        *current = None;
+                    }
+                    for range in &mut self.bend_ranges {
+                        *range = DEFAULT_BEND_RANGE;
+                    }
+                    for track in &self.tracks {
+                        let chip = driver.chip.clone();
+                        {
+                            let mut tb = track.borrow_mut();
+                            tb.set_pitch_bend(0);
+                            tb.set_expression(128);
+                            tb.set_velocity(0);
+                        }
+                        track.borrow_mut().key_off(0, false, &mut *chip.borrow_mut());
+                    }
                 }
-                track.borrow_mut().key_off(0, false, &mut *chip.borrow_mut());
             }
+        }
+        if self.ended {
+            return;
         }
 
         for (slot, channel) in self.song.channels.iter().enumerate() {
@@ -742,9 +855,21 @@ impl MidiPlayer {
                     tb.set_pitch_bend((semis * 64.0).round() as i32);
                 }
                 if let Some(v) = expression {
+                    // CC11 scales the channel from its CC7 level (max = 100%),
+                    // applied through SiON's expression table rather than the
+                    // master volume: that table is a linear amplitude ramp, so
+                    // this is the same curve MIDI expression specifies, and it
+                    // stays in range because velocities do too (see
+                    // VELOCITY_SCALE).
                     tb.set_expression(v as i32);
                 }
-                let master = (self.volumes[slot] as f32 / 127.0 * VOLUME_SPAN * gain)
+                // CC7 sets the channel level; the bus mixer scale keeps the
+                // ensemble off the ceiling, and CC11 (applied above through the
+                // expression table) scales the result from there.
+                let master = (self.volumes[slot] as f32 / 127.0
+                    * VOLUME_SPAN
+                    * gain
+                    * self.headroom)
                     .round()
                     .clamp(0.0, VOLUME_SPAN);
                 tb.set_master_volume(master as i32);
@@ -763,38 +888,34 @@ impl MidiPlayer {
                 continue; // executor slot busy with an un-fired note
             }
 
-            // Arm the next note at the last pump before its start (the
-            // one-block window keeps the arming delay from freezing a
-            // ringing note longer than one block). Gap-following notes
-            // wait for the previous note-off so its release rings out.
-            while let Some(next) = channel.notes.get(self.note_cursor[slot]) {
+            // Arm at most one note per pump: the executor holds a single
+            // pending chain. Arming at the last pump before the note's start
+            // keeps the arming delay from freezing a ringing note longer than
+            // one block, and a note following a gap waits for the previous
+            // note-off so its release rings out first.
+            if let Some(next) = channel.notes.get(self.note_cursor[slot]) {
                 let start = self.event_sample(next.start_tick);
-                if start > now + block {
-                    break; // beyond the next rendered block
-                }
-                if let Some(prev) = current {
-                    if start > prev.end && now < prev.end {
-                        break; // gap: let the previous release ring out first
+                let beyond_block = start > now + block;
+                let gap_ahead = current.is_some_and(|p| start > p.end && now < p.end);
+                if !beyond_block && !gap_ahead {
+                    let length_res = ((next.end_tick - next.start_tick) as f64 * RESOLUTION
+                        / self.song.ppq as f64)
+                        .round();
+                    let delay = (start - now).max(0) as i32;
+                    {
+                        let mut tb = track.borrow_mut();
+                        tb.set_velocity(
+                            (next.velocity as f32 * VELOCITY_SCALE).clamp(0.0, VELOCITY_MAX) as i32,
+                        );
+                        tb.key_on(next.note, length_res as i32, delay);
                     }
+                    self.current[slot] = Some(CurrentNote {
+                        start,
+                        end: self.event_sample(next.end_tick),
+                        fired: false,
+                    });
+                    self.note_cursor[slot] += 1;
                 }
-                let length_res = ((next.end_tick - next.start_tick) as f64 * RESOLUTION
-                    / self.song.ppq as f64)
-                    .round();
-                let delay = (start - now).max(0) as i32;
-                {
-                    let mut tb = track.borrow_mut();
-                    tb.set_velocity(
-                        (next.velocity as f32 * VELOCITY_SCALE).round().clamp(0.0, 512.0) as i32,
-                    );
-                    tb.key_on(next.note, length_res as i32, delay);
-                }
-                self.current[slot] = Some(CurrentNote {
-                    start,
-                    end: self.event_sample(next.end_tick),
-                    fired: false,
-                });
-                self.note_cursor[slot] += 1;
-                break;
             }
         }
     }
@@ -802,5 +923,21 @@ impl MidiPlayer {
     /// Number of reserved tracks (one per melodic channel).
     pub fn track_count(&self) -> usize {
         self.tracks.len()
+    }
+
+    /// Silence the channels and hand their reservations back to the pool.
+    /// A `USER_CONTROLLED` track stays "active" for as long as it is
+    /// non-disposable, so it is never re-handed-out and can never be robbed —
+    /// without `set_disposable` a cue triggered on every scene entry would
+    /// eat the whole track budget. The sequencer keeps its own handle (there
+    /// is no per-track free), so recycling happens on the next reservation.
+    pub fn release(mut self, driver: &mut SiONDriver) {
+        let chip = driver.chip.clone();
+        for track in self.tracks.drain(..) {
+            let mut tb = track.borrow_mut();
+            tb.set_master_volume(0);
+            tb.key_off(0, false, &mut *chip.borrow_mut());
+            tb.set_disposable();
+        }
     }
 }
