@@ -20,7 +20,7 @@ load.stats = LV --   Play 0:00
 load.empty = No data
 load.plate = Select a slot to load the adventure.
 load.none = -- Empty save slot: nothing to load --
-load.hint = ↑↓ Slots   Enter Load   Esc Back
+load.hint = ↑↓←→ Slots   Enter Load   Esc Back
 
 options.title = Options
 options.music = Music Volume

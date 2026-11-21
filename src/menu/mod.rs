@@ -123,6 +123,8 @@ struct OptionsState {
 }
 
 const SLOT_COUNT: usize = 4;
+// Grid layout of the slot grid in `draw_loadgame`: two columns, row = i / cols.
+const LOAD_GRID_COLS: usize = 2;
 const PORTRAIT_W: u32 = 480;
 const PORTRAIT_H: u32 = 640;
 
@@ -494,14 +496,25 @@ impl App {
             }
 
             Mode::LoadGame => {
-                if (pressed(KeyCode::Up) || pressed(KeyCode::W)) && self.load_state.selected > 0 {
-                    self.load_state.selected -= 1;
+                let sel = self.load_state.selected;
+                let col = sel % LOAD_GRID_COLS;
+                let row = sel / LOAD_GRID_COLS;
+
+                if (pressed(KeyCode::Up) || pressed(KeyCode::W)) && row > 0 {
+                    self.load_state.selected = (row - 1) * LOAD_GRID_COLS + col;
                     self.play_sfx(SfxId::Move);
-                }
-                if (pressed(KeyCode::Down) || pressed(KeyCode::S))
-                    && self.load_state.selected + 1 < SLOT_COUNT
+                } else if (pressed(KeyCode::Down) || pressed(KeyCode::S))
+                    && (row + 1) * LOAD_GRID_COLS + col < SLOT_COUNT
                 {
-                    self.load_state.selected += 1;
+                    self.load_state.selected = (row + 1) * LOAD_GRID_COLS + col;
+                    self.play_sfx(SfxId::Move);
+                } else if (pressed(KeyCode::Left) || pressed(KeyCode::A)) && col > 0 {
+                    self.load_state.selected = row * LOAD_GRID_COLS + (col - 1);
+                    self.play_sfx(SfxId::Move);
+                } else if (pressed(KeyCode::Right) || pressed(KeyCode::D))
+                    && row * LOAD_GRID_COLS + col + 1 < SLOT_COUNT
+                {
+                    self.load_state.selected = row * LOAD_GRID_COLS + col + 1;
                     self.play_sfx(SfxId::Move);
                 }
 
@@ -742,8 +755,8 @@ impl App {
 
         for i in 0..SLOT_COUNT {
             let sel = self.load_state.selected == i;
-            let x = x0 + if i % 2 == 0 { 0.0 } else { slot_w + gap };
-            let y = y0 + (i / 2) as f32 * (slot_h + gap);
+            let x = x0 + if i % LOAD_GRID_COLS == 0 { 0.0 } else { slot_w + gap };
+            let y = y0 + (i / LOAD_GRID_COLS) as f32 * (slot_h + gap);
 
             draw_rectangle(
                 x, y, slot_w, slot_h,

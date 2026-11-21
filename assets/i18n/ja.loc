@@ -20,7 +20,7 @@ load.stats = Lv --   プレイ 0:00
 load.empty = データなし
 load.plate = 冒険をロードするスロットを選んでください。
 load.none = —— 空のスロット：読み込めるデータはありません ——
-load.hint = ↑↓ スロット   Enter 読込   Esc 戻る
+load.hint = ↑↓←→ スロット   Enter 読込   Esc 戻る
 
 options.title = 設定
 options.music = 音楽音量
